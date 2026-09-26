@@ -21,7 +21,7 @@ import json
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 from PIL import Image
@@ -118,6 +118,7 @@ def process_image_to_variants(
     max_retries: int = 3,
     use_ai: bool = True,
     save_intermediates: bool = False,
+    progress_callback: Callable[[str, int], None] | None = None,
 ) -> ImagePipelineResult:
     """Process a single image into all 4 platform-ready variants.
 
@@ -157,10 +158,14 @@ def process_image_to_variants(
     manifests_dir.mkdir(parents=True, exist_ok=True)
 
     # Load image once
+    if progress_callback:
+        progress_callback("Perception: detecting subjects in image", 15)
     img = Image.open(image_path)
     src_w, src_h = img.size
 
     # Detect subjects once (shared across all variants)
+    if progress_callback:
+        progress_callback("Perception: subjects detected, planning crops", 30)
     subjects, model_used = detect_subjects(image_path)
 
     # Detect AI availability
@@ -170,6 +175,8 @@ def process_image_to_variants(
     all_passed = True
 
     for ratio_name, target_ratio in TARGET_ASPECT_RATIOS.items():
+        if progress_callback:
+            progress_callback(f"Rendering variant {ratio_name} ({target_ratio:.2f})", 40 + int(50 * list(TARGET_ASPECT_RATIOS.keys()).index(ratio_name) / 4))
         t0 = time.perf_counter()
 
         # Run the full regeneration loop for this ratio
@@ -227,6 +234,8 @@ def process_image_to_variants(
             processing_time_sec=processing_time,
         )
 
+    if progress_callback:
+        progress_callback("Validation: checking all variants", 95)
     return ImagePipelineResult(
         image_path=str(image_path),
         image_width=src_w,

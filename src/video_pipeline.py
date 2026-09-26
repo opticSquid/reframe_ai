@@ -17,7 +17,7 @@ import json
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from .config import (
     OUTPUT_DIR,
@@ -38,6 +38,7 @@ from .video_speaker import (
     infer_active_speaker_timeline, build_crop_trajectory,
 )
 from .video_rendering import render_vertical_video
+from .video_review import gemini_review_video, VideoReviewResult
 from .validator import validate_asset
 
 
@@ -55,12 +56,15 @@ class VideoPipelineResult:
     audio_time_sec: float
     speaker_time_sec: float
     render_time_sec: float
+    review_time_sec: float
     total_time_sec: float
     reel_path: str
     still_path: str
     debug_path: str | None
     validation: Any  # ValidationResult
     manifest: dict[str, Any] = field(default_factory=dict)
+    ai_review: VideoReviewResult | None = None
+    still_paths: list[str] = field(default_factory=list)
 
     def to_summary(self) -> dict[str, Any]:
         return {
@@ -75,16 +79,29 @@ class VideoPipelineResult:
                 "audio": round(self.audio_time_sec, 2),
                 "speaker": round(self.speaker_time_sec, 2),
                 "render": round(self.render_time_sec, 2),
+                "review": round(self.review_time_sec, 2),
                 "total": round(self.total_time_sec, 2),
             },
             "outputs": {
                 "reel": self.reel_path,
                 "still": self.still_path,
                 "debug": self.debug_path,
+                "stills": self.still_paths,
             },
             "validation_passed": self.validation.passed if self.validation else False,
             "validation_errors": self.validation.errors if self.validation else [],
             "validation_warnings": self.validation.warnings if self.validation else [],
+            "ai_review": (
+                {
+                    "passed": self.ai_review.passed,
+                    "score": self.ai_review.score,
+                    "frames_reviewed": self.ai_review.frames_reviewed,
+                    "errors": self.ai_review.errors,
+                    "warnings": self.ai_review.warnings,
+                    "suggestions": self.ai_review.suggestions,
+                }
+                if self.ai_review else None
+            ),
         }
 
 
@@ -94,6 +111,7 @@ def process_video_to_reel(
     target_fps: float = VIDEO_SAMPLE_FPS,
     landmark_fps: float = VIDEO_LANDMARK_FPS,
     generate_debug: bool = True,
+    progress_callback: Callable[[str, int], None] | None = None,
 ) -> VideoPipelineResult:
     """Process a master video into a vertical 9:16 reel with dynamic cropping.
 
@@ -122,6 +140,8 @@ def process_video_to_reel(
     # ------------------------------------------------------------------
     # Stage 1: Ingest
     # ------------------------------------------------------------------
+    if progress_callback:
+        progress_callback("Ingest: extracting video metadata", 10)
     metadata = extract_video_metadata(video_path)
     # Compute output dimensions from target ratio
     if REEL_ASPECT_RATIO < 1.0:
@@ -134,6 +154,8 @@ def process_video_to_reel(
     # ------------------------------------------------------------------
     # Stage 2: Perception (frame sampling + face detection + tracking)
     # ------------------------------------------------------------------
+    if progress_callback:
+        progress_callback("Perception: detecting faces and tracking speakers", 20)
     t0 = time.perf_counter()
 
     # Extract frames at target_fps, scaled to max_dim=640
@@ -179,6 +201,8 @@ def process_video_to_reel(
     # ------------------------------------------------------------------
     # Stage 3: Audio analysis
     # ------------------------------------------------------------------
+    if progress_callback:
+        progress_callback("Audio: detecting speech activity", 40)
     t_audio_0 = time.perf_counter()
     speech_activity = detect_speech_activity(video_path, metadata)
     t_audio_1 = time.perf_counter()
@@ -187,6 +211,8 @@ def process_video_to_reel(
     # Stage 4: Face landmarks (MAR) on sampled frames during speech
     # Only compute MAR on a subset of frames to save time
     # ------------------------------------------------------------------
+    if progress_callback:
+        progress_callback("Speaker: inferring active speaker timeline", 55)
     t_speaker_0 = time.perf_counter()
 
     # Re-run perception with landmarks at lower fps
@@ -252,6 +278,8 @@ def process_video_to_reel(
     # ------------------------------------------------------------------
     # Stage 7: Render
     # ------------------------------------------------------------------
+    if progress_callback:
+        progress_callback("Render: generating vertical reel and stills", 70)
     t_render_0 = time.perf_counter()
 
     reel_path = str(video_reels_dir / f"{stem}_9_16.mp4")
@@ -275,8 +303,27 @@ def process_video_to_reel(
     t_render_1 = time.perf_counter()
 
     # ------------------------------------------------------------------
-    # Stage 8: Validation
+    # Stage 8: AI Visual Review (post-rendering Gemini critique)
     # ------------------------------------------------------------------
+    if progress_callback:
+        progress_callback("Review: Gemini assessing framing quality", 85)
+    t_review_0 = time.perf_counter()
+    ai_review = gemini_review_video(
+        original_video_path=video_path,
+        reel_video_path=render_result.reel_path,
+        trajectory=trajectory,
+        segments=segments,
+        shot_boundaries=shot_bounds,
+        metadata=metadata,
+        max_review_frames=12,
+    )
+    t_review_1 = time.perf_counter()
+
+    # ------------------------------------------------------------------
+    # Stage 9: Validation
+    # ------------------------------------------------------------------
+    if progress_callback:
+        progress_callback("Validation: checking against platform spec", 95)
     manifest = _build_video_manifest(
         video_path=video_path,
         stem=stem,
@@ -296,7 +343,8 @@ def process_video_to_reel(
 
     # Save all debug artifacts
     _save_artifacts(stem, output_dir, metadata, tracks, shot_bounds,
-                    speech_activity, segments, trajectory, render_result, validation)
+                    speech_activity, segments, trajectory, render_result, validation,
+                    ai_review)
 
     t_end = time.perf_counter()
 
@@ -311,12 +359,15 @@ def process_video_to_reel(
         audio_time_sec=t_audio_1 - t_audio_0,
         speaker_time_sec=t_speaker_1 - t_audio_1,
         render_time_sec=t_render_1 - t_render_0,
+        review_time_sec=t_review_1 - t_review_0,
         total_time_sec=t_end - t_start,
         reel_path=render_result.reel_path,
         still_path=render_result.still_path,
         debug_path=render_result.debug_path,
         validation=validation,
         manifest=manifest,
+        ai_review=ai_review,
+        still_paths=render_result.still_paths,
     )
 
 
@@ -381,6 +432,7 @@ def _save_artifacts(
     trajectory: list[CropTrajectoryPoint],
     render_result: Any,
     validation: Any,
+    ai_review: VideoReviewResult | None = None,
 ) -> None:
     """Save all debug artifacts as JSON files."""
     manifests_dir = output_dir / "manifests"
@@ -440,3 +492,17 @@ def _save_artifacts(
     (manifests_dir / f"{stem}_speech_activity.json").write_text(
         json.dumps(speech_activity.to_dict(), indent=2),
     )
+
+    # ai_review.json — Gemini post-rendering visual review (if available)
+    if ai_review is not None:
+        review_data = {
+            "passed": ai_review.passed,
+            "score": ai_review.score,
+            "frames_reviewed": ai_review.frames_reviewed,
+            "errors": ai_review.errors,
+            "warnings": ai_review.warnings,
+            "suggestions": ai_review.suggestions,
+        }
+        (manifests_dir / f"{stem}_ai_review.json").write_text(
+            json.dumps(review_data, indent=2),
+        )
