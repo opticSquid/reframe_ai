@@ -20,6 +20,10 @@ VIDEO_REELS_DIR = OUTPUT_DIR / "video_reels"
 STILLS_DIR = OUTPUT_DIR / "stills"
 MANIFESTS_DIR = OUTPUT_DIR / "manifests"
 
+# MediaPipe models
+MODELS_DIR = PROJECT_ROOT / "models"
+FACE_DETECTION_MODEL = MODELS_DIR / "blaze_face_full_range_sparse_float16.tflite"
+
 # ---------------------------------------------------------------------------
 # Platform spec
 # ---------------------------------------------------------------------------
