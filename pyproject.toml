@@ -8,13 +8,19 @@ version = "0.1.0"
 description = "Subject-aware media pipeline MVP"
 requires-python = ">=3.14"
 dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
+    "httpx>=0.27",
     "numpy",
     "pillow",
     "pyyaml",
 ]
 
 [project.optional-dependencies]
-dev = ["pytest"]
+dev = [
+    "pytest",
+    "google-genai>=1.0",
+]
 
 [tool.setuptools.packages.find]
 where = ["."]

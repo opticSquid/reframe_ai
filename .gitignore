@@ -13,6 +13,11 @@ venv/
 # Output (generated at runtime)
 output/
 
+# Frontend (Next.js)
+frontend/node_modules/
+frontend/.next/
+frontend/out/
+
 # IDE
 .vscode/
 .idea/
