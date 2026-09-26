@@ -39,25 +39,24 @@ img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=np.ascontiguousarray(img_rgb))
 
 # ---------------------------------------------------------------------------
-# 2. MediaPipe Face Detection
+# 2. MediaPipe Face Detection (BlazeFace full-range)
 # ---------------------------------------------------------------------------
-# Try to find the correct face detection model
+# Try face-specific model first
 face_model = None
-for name in ["face_detection_short.tflite", "face_detection_front.tflite",
-             "face_detection_short_front.tflite"]:
+for name in [
+    "blaze_face_full_range_sparse.tflite",
+    "face_detection_short.tflite",
+    "face_detection_front.tflite",
+    "face_detection_short_front.tflite",
+]:
     p = MODELS_DIR / name
     if p.exists():
         face_model = p
         break
 
-if face_model is None:
-    # Download the correct MediaPipe face detection model
-    print("No face-specific model found, trying ObjectDetector with efficientdet_lite0...")
-
-# Try FaceDetector with face-specific model
 faces = []
 if face_model:
-    print(f"Using face model: {face_model}")
+    print(f"Using face model: {face_model.name}")
     try:
         base_opts = mp_tasks.BaseOptions(model_asset_path=str(face_model))
         face_opts = mp_vision.FaceDetectorOptions(
@@ -80,9 +79,10 @@ if face_model:
         detector.close()
     except Exception as e:
         print(f"  FaceDetector error: {e}")
-else:
-    # Fallback: ObjectDetector with efficientdet_lite0 (general object detection)
-    print("Using ObjectDetector with efficientdet_lite0...")
+
+# Fallback: ObjectDetector with efficientdet_lite0 (general object detection)
+if not faces:
+    print("No faces detected or FaceDetector unavailable, trying ObjectDetector...")
     try:
         model_path = MODELS_DIR / "efficientdet_lite0.tflite"
         base_opts = mp_tasks.BaseOptions(model_asset_path=str(model_path))
@@ -193,7 +193,7 @@ report = {
     "image": str(IMAGE_PATH),
     "image_size": {"width": w, "height": h},
     "target_ratio": TARGET_RATIO,
-    "model": "MediaPipe efficientdet_lite0 (ObjectDetector task)",
+    "model": "MediaPipe FaceDetector (blaze_face_full_range_sparse.tflite)",
     "detections": faces,
     "union_bbox": union_bbox,
     "crop_results": {
