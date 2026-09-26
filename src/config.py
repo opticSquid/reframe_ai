@@ -23,6 +23,9 @@ MANIFESTS_DIR = OUTPUT_DIR / "manifests"
 # MediaPipe models
 MODELS_DIR = PROJECT_ROOT / "models"
 FACE_DETECTION_MODEL = MODELS_DIR / "blaze_face_full_range_sparse_float16.tflite"
+FACE_LANDMARKER_MODEL = MODELS_DIR / "face_landmarker_float16.task"
+PERSON_DETECTION_MODEL = MODELS_DIR / "efficientdet_lite0_float16.tflite"
+POSE_LANDMARKER_MODEL = MODELS_DIR / "pose_landmarker_full_float16.task"
 
 # ---------------------------------------------------------------------------
 # Platform spec
@@ -50,6 +53,10 @@ STILL_ASPECT_RATIO = 1.0     # 1:1 square
 # ---------------------------------------------------------------------------
 # Keyframe interval for video processing (every N frames)
 VIDEO_KEYFRAME_INTERVAL = 25  # 25fps → ~1 keyframe per second
+
+# Frame sampling rate for perception (frames per second to analyze)
+VIDEO_SAMPLE_FPS = 4.0          # detection/tracking sampling
+VIDEO_LANDMARK_FPS = 2.0       # face landmark sampling (MAR computation)
 
 # Frame resize for AI model inference (keeps CPU inference fast)
 INFERENCE_WIDTH = 640

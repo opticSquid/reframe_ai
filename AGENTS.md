@@ -18,12 +18,14 @@ Subject-aware media pipeline: master image → 4 subject-aware crops; master vid
 
 ```bash
 source .venv/bin/activate
-uvicorn src.main:app --host 0.0.0.0 --port 5000   # run FastAPI backend
+uvicorn src.main:app --host 0.0.0.0 --port 5000        # run FastAPI backend
+cd frontend && npm install && npm run dev             # run Next.js frontend (port 3000)
 python -m pytest tests/ -v          # 57 tests, ~7s
 python -m pytest tests/ -x          # stop on first failure
 ```
 
 Pytest config is in `pyproject.toml` (`testpaths=["tests"]`, `pythonpath=["."]`).
+Frontend needs Node 20+ (see `frontend/package.json`).
 
 ## Conventions
 
@@ -41,8 +43,10 @@ Pytest config is in `pyproject.toml` (`testpaths=["tests"]`, `pythonpath=["."]`)
 - **Image crop** (`src/image_crop.py`): MediaPipe BlazeFace detection + crop planning (`plan_crop`) and rendering (`render_crop`). Separates planning from pixel rendering.
 - **Regeneration** (`src/regeneration.py`): AI-assisted generate→validate→feedback→retry loop. Gemini provides semantic crop recommendations and critique; validator runs as-is.
 - **Validator** (`src/validator.py`): enforces dimensions, aspect ratio (±2%), subject framing, watermark overlap, audio presence, required metadata fields.
-- **Backend** (`src/main.py`): FastAPI app with CORS; run with `uvicorn src.main:app --host 0.0.0.0 --port 5000`.
-- `scripts/`: spike/demo scripts (`spike_crop.py`, `demo_regeneration.py`, `test_gemini.py`).
+- **Backend** (`src/main.py`): FastAPI app with CORS. Endpoints: `GET /health`, `POST /process-image`, `POST /process-image/variant/{ratio_name}`. Run with `uvicorn src.main:app --host 0.0.0.0 --port 5000`.
+- **Pipeline** (`src/pipeline.py`): top-level orchestrator — `process_image_to_variants` (all 4 ratios) and `process_single_variant`. Ties together detection→AI planning→rendering→validation→regeneration.
+- **Image utils** (`src/_image_utils.py`): helpers for converting between numpy arrays and PNG bytes.
+- `scripts/`: spike/demo scripts (`spike_crop.py`, `demo_regeneration.py`, `test_gemini.py`, `run_image_mvp.py` — end-to-end image pipeline runner).
 - Output dirs: `output/image_variants/`, `output/video_reels/`, `output/stills/`, `output/manifests/` (all gitignored).
 
 ## Pitfalls
@@ -52,4 +56,4 @@ Pytest config is in `pyproject.toml` (`testpaths=["tests"]`, `pythonpath=["."]`)
 - Validator's file-dimension check (`verify_files=True`) uses PIL on the actual output file — tests create temp files with `PIL.Image.new(...)`.
 - Video audio check requires `ffprobe`; tests with `verify_files=False` skip disk checks.
 - `.env` is gitignored — if tests or runtime code needs `GEMINI_API_KEY`, provide it or expect graceful degradation.
-- Docker: backend port 5000, frontend port 3000. Run `docker compose up --build` for local multi-service.
+- Docker: backend port 5000, frontend port 3000. Run `docker compose up --build` for local multi-service. Frontend built via `Dockerfile.frontend` (Node → nginx serving static export).

@@ -10,6 +10,7 @@ from fastapi.responses import JSONResponse
 
 from .config import OUTPUT_DIR
 from .pipeline import process_image_to_variants, process_single_variant, ImagePipelineResult, VariantResult
+from .video_pipeline import process_video_to_reel
 
 app = FastAPI(title="ReframeAI Backend", version="0.1.0")
 
@@ -101,3 +102,25 @@ async def process_image_variant(
         "explanation": result.explanation,
         "ai_status": result.ai_status,
     })
+
+
+@app.post("/process-video")
+async def process_video(
+    file: UploadFile = File(...),
+    generate_debug: bool = Form(default=True),
+) -> JSONResponse:
+    """Process an uploaded video into a vertical 9:16 speaker-aware reel."""
+    upload_dir = OUTPUT_DIR / "uploads" / uuid.uuid4().hex
+    upload_dir.mkdir(parents=True, exist_ok=True)
+
+    input_path = upload_dir / f"input_{file.filename}"
+    content = await file.read()
+    input_path.write_bytes(content)
+
+    result = process_video_to_reel(
+        video_path=input_path,
+        output_dir=upload_dir,
+        generate_debug=generate_debug,
+    )
+
+    return JSONResponse(content=result.to_summary())
