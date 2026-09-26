@@ -64,7 +64,7 @@ MIN_OBJECT_CONFIDENCE = 0.4
 # Gemini API
 # ---------------------------------------------------------------------------
 GEMINI_API_KEY_ENV = "GEMINI_API_KEY"
-GEMINI_MODEL = "gemini-2.5-flash"
+GEMINI_MODEL = "gemini-3.8-flash"
 
 
 def get_gemini_api_key() -> str | None:

@@ -46,6 +46,8 @@ class CropPlan:
     model_used: str = ""
     detection_count: int = 0
     warnings: list[str] = field(default_factory=list)
+    ai_reasoning: str = ""
+    image_description: str = ""
 
     def to_metadata(self) -> dict:
         """Serializable metadata for manifests / reports."""
@@ -69,6 +71,7 @@ class CropPlan:
                 "scale_used": round(self.crop.scale_used, 4),
                 "is_center_fallback": self.crop.is_center_fallback,
             },
+            "image_description": self.image_description,
         }
 
 
@@ -172,11 +175,27 @@ def plan_crop(
     target_coverage: float = 0.5,
     min_margin: float = 0.1,
     min_confidence: float = 0.3,
+    min_crop_w: int = 0,
+    min_crop_h: int = 0,
+    max_crop_w: int = 0,
+    max_crop_h: int = 0,
+    center_x: int | None = None,
+    center_y: int | None = None,
 ) -> CropPlan:
     """Plan a subject-aware crop: detect subjects then compute crop coordinates.
 
     Does NOT read or write any image pixels beyond what MediaPipe needs
     for inference.  Use :func:`render_crop` to apply the result.
+
+    Parameters
+    ----------
+    min_crop_w, min_crop_h
+        Minimum crop dimensions.  If the subject-based crop is smaller,
+        it is upscaled to these dimensions while preserving the target
+        aspect ratio and centering on the subject centroid.
+    max_crop_w, max_crop_h
+        Maximum crop dimensions.  If the subject-based crop is larger,
+        it is downscaled to these dimensions.
     """
     image_path = Path(image_path)
     img = Image.open(image_path)
@@ -193,7 +212,87 @@ def plan_crop(
         target_ratio=target_ratio,
         target_coverage=target_coverage,
         min_margin=min_margin,
+        center_x=float(center_x) if center_x is not None else None,
+        center_y=float(center_y) if center_y is not None else None,
     )
+
+    # Enforce minimum dimensions (upscale if crop is too small)
+    if min_crop_w > 0 and min_crop_h > 0:
+        if crop_result.width < min_crop_w or crop_result.height < min_crop_h:
+            # Recompute at minimum size, centered on subject centroid
+            if target_ratio >= 1.0:
+                cw = float(min_crop_w)
+                ch = cw / target_ratio
+            else:
+                ch = float(min_crop_h)
+                cw = ch * target_ratio
+            # Ensure we don't exceed source dimensions
+            cw = min(cw, float(w))
+            ch = min(ch, float(h))
+            if target_ratio >= 1.0:
+                ch = cw / target_ratio
+            else:
+                cw = ch * target_ratio
+
+            centroid_x, centroid_y = _subject_centroid(subjects, w, h)
+            x = max(0, centroid_x - cw / 2)
+            y = max(0, centroid_y - ch / 2)
+            x = max(0, min(x, float(w - cw)))
+            y = max(0, min(y, float(h - ch)))
+
+            # Recompute edge cutoffs for the new crop
+            edge_cutoffs = _compute_edge_cutoffs_from_crop(
+                subjects, int(x), int(y), int(cw), int(ch)
+            )
+            crop_result = CropResult(
+                x=int(round(x)),
+                y=int(round(y)),
+                width=max(1, int(round(cw))),
+                height=max(1, int(round(ch))),
+                subject_coverage_pct=crop_result.subject_coverage_pct,
+                edge_cutoffs=edge_cutoffs,
+                primary_subject_center=crop_result.primary_subject_center,
+                scale_used=crop_result.scale_used * (cw / crop_result.width) if crop_result.width > 0 else 1.0,
+                is_center_fallback=crop_result.is_center_fallback,
+            )
+
+    # Enforce maximum dimensions (downscale if crop is too large)
+    if max_crop_w > 0 and max_crop_h > 0:
+        if crop_result.width > max_crop_w or crop_result.height > max_crop_h:
+            if target_ratio >= 1.0:
+                cw = float(max_crop_w)
+                ch = cw / target_ratio
+            else:
+                ch = float(max_crop_h)
+                cw = ch * target_ratio
+            cw = min(cw, float(w))
+            ch = min(ch, float(h))
+            if target_ratio >= 1.0:
+                ch = cw / target_ratio
+            else:
+                cw = ch * target_ratio
+            cw = max(1, cw)
+            ch = max(1, ch)
+            centroid_x, centroid_y = _subject_centroid(subjects, w, h)
+            x = max(0, centroid_x - cw / 2)
+            y = max(0, centroid_y - ch / 2)
+            x = max(0, min(x, float(w - cw)))
+            y = max(0, min(y, float(h - ch)))
+            edge_cutoffs = _compute_edge_cutoffs_from_crop(
+                subjects, int(x), int(y), int(cw), int(ch)
+            )
+            crop_result = CropResult(
+                x=int(round(x)),
+                y=int(round(y)),
+                width=max(1, int(round(cw))),
+                height=max(1, int(round(ch))),
+                subject_coverage_pct=crop_result.subject_coverage_pct,
+                edge_cutoffs=edge_cutoffs,
+                primary_subject_center=crop_result.primary_subject_center,
+                scale_used=crop_result.scale_used * (cw / crop_result.width)
+                if crop_result.width > 0 else 1.0,
+                is_center_fallback=crop_result.is_center_fallback,
+            )
 
     warnings_list: list[str] = []
     if not subjects:
@@ -267,3 +366,43 @@ def process_all_ratios(
     for name, ratio in TARGET_ASPECT_RATIOS.items():
         plans[name] = plan_crop(image_path, target_ratio=ratio)
     return plans
+
+
+# ---------------------------------------------------------------------------
+# Internal helpers
+# ---------------------------------------------------------------------------
+def _subject_centroid(
+    subjects: list[Subject], src_w: int, src_h: int
+) -> tuple[float, float]:
+    """Weighted centroid of subject centers.  Falls back to image center."""
+    if not subjects:
+        return (src_w / 2, src_h / 2)
+    total_w = sum(max(s.importance, 0.001) for s in subjects)
+    cx = sum((s.bbox[0] + s.bbox[2] / 2) * max(s.importance, 0.001) for s in subjects) / total_w
+    cy = sum((s.bbox[1] + s.bbox[3] / 2) * max(s.importance, 0.001) for s in subjects) / total_w
+    return (cx, cy)
+
+
+def _compute_edge_cutoffs_from_crop(
+    subjects: list[Subject],
+    crop_x: int, crop_y: int, crop_w: int, crop_h: int,
+) -> dict[str, float]:
+    """Compute per-edge cutoff fractions for subjects relative to a crop box."""
+    cutoffs = {"top": 0.0, "bottom": 0.0, "left": 0.0, "right": 0.0}
+    for s in subjects:
+        sx, sy, sw, sh = s.bbox
+        if sw * sh < 1:
+            continue
+        # Left cutoff
+        if sx < crop_x:
+            cutoffs["left"] = max(cutoffs["left"], (crop_x - sx) / sw)
+        # Right cutoff
+        if sx + sw > crop_x + crop_w:
+            cutoffs["right"] = max(cutoffs["right"], ((sx + sw) - (crop_x + crop_w)) / sw)
+        # Top cutoff
+        if sy < crop_y:
+            cutoffs["top"] = max(cutoffs["top"], (crop_y - sy) / sh)
+        # Bottom cutoff
+        if sy + sh > crop_y + crop_h:
+            cutoffs["bottom"] = max(cutoffs["bottom"], ((sy + sh) - (crop_y + crop_h)) / sh)
+    return {k: round(v, 4) for k, v in cutoffs.items()}

@@ -109,6 +109,8 @@ def compute_crop(
     target_coverage: float = 0.5,
     min_margin: float = 0.1,
     max_edge_cutoff: float = 0.25,
+    center_x: float | None = None,
+    center_y: float | None = None,
 ) -> CropResult:
     """Compute the optimal subject-aware crop.
 
@@ -128,6 +130,10 @@ def compute_crop(
     max_edge_cutoff
         Maximum fraction of a subject that may be cut off at any edge.
         If cutting would exceed this, the crop is adjusted.
+    center_x, center_y
+        Optional explicit center coordinates (in source pixels). When provided,
+        the crop is centered here instead of on the weighted subject centroid.
+        Used by the AI planner to honor Gemini's recommended framing.
 
     Returns
     -------
@@ -189,9 +195,12 @@ def compute_crop(
         crop_h = crop_w / target_ratio
 
     # ------------------------------------------------------------------
-    # Step 3: Center on weighted subject centroid
+    # Step 3: Center on weighted subject centroid (or AI-specified center)
     # ------------------------------------------------------------------
-    centroid_x, centroid_y = _weighted_centroid(subjects)
+    if center_x is not None and center_y is not None:
+        centroid_x, centroid_y = center_x, center_y
+    else:
+        centroid_x, centroid_y = _weighted_centroid(subjects)
 
     # Ideal crop position (centered on centroid)
     ideal_x = centroid_x - crop_w / 2
