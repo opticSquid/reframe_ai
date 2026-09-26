@@ -6,6 +6,10 @@ If not set, Gemini-dependent features degrade gracefully with a user-friendly er
 
 import os
 from pathlib import Path
+from dotenv import load_dotenv
+
+# Load .env from project root if present
+load_dotenv()
 
 # ---------------------------------------------------------------------------
 # Paths

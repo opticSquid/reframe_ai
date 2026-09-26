@@ -374,8 +374,7 @@ class VideoPerceiver:
             base_options=mp_tasks.BaseOptions(model_asset_path=model_path),
             num_poses=10,
             min_pose_presence_confidence=0.5,
-            min_pose_tracking_confidence=0.5,
-            min_tracking_time_threshold_ms=100,
+            min_tracking_confidence=0.5,
         )
         self._pose_landmarker = mp_vision.PoseLandmarker.create_from_options(opts)
         return self._pose_landmarker
