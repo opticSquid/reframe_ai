@@ -353,7 +353,7 @@ def process_video_to_reel(
         # On retry, adjust segment boundaries or crop width based on feedback
         cur_seg_start = best_seg_start
         cur_seg_end = best_seg_end
-        cur_tc = 0.4  # default target_coverage
+        cur_tc = 0.35  # default target_coverage (looser crop to keep faces in frame)
 
         if attempt > 0:
             # If review said something was missing, shift the segment
@@ -387,7 +387,7 @@ def process_video_to_reel(
             cur_tc = best_crop_plan.recommended_coverage
         if attempt > 0:
             # Widen crop to capture more context on retry
-            cur_tc = max(0.3, cur_tc - 0.05 * attempt)
+            cur_tc = max(0.25, cur_tc - 0.05 * attempt)
 
         # Build trajectory for full video, then slice to segment
         trajectory = build_crop_trajectory(

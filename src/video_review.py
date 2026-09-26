@@ -492,7 +492,7 @@ class GeminiCropPlanResult:
     """Result of Gemini's pre-render crop planning."""
 
     recommended_center: tuple[float, float] | None  # normalized (x, y)
-    recommended_coverage: float | None               # 0.3–0.8
+    recommended_coverage: float | None               # 0.25–0.5
     errors: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     suggestions: list[str] = field(default_factory=list)
@@ -720,12 +720,12 @@ def gemini_plan_crop(
             if seg.start <= seg_mid <= seg.end:
                 return GeminiCropPlanResult(
                     recommended_center=(0.5, 0.5),
-                    recommended_coverage=0.45,
+                    recommended_coverage=0.35,
                     raw_response="Gemini not available — using deterministic center",
                 )
         return GeminiCropPlanResult(
             recommended_center=(0.5, 0.5),
-            recommended_coverage=0.45,
+            recommended_coverage=0.35,
             raw_response="Gemini not available — using frame center",
         )
 
@@ -795,7 +795,7 @@ def gemini_plan_crop(
     if not frames_data:
         return GeminiCropPlanResult(
             recommended_center=(0.5, 0.5),
-            recommended_coverage=0.45,
+            recommended_coverage=0.35,
             errors=["No keyframes could be extracted for crop planning"],
             raw_response="",
         )
@@ -858,7 +858,7 @@ Respond with ONLY a JSON object:
 {{
   "center_x": float,   // recommended normalized crop center X (0.0–1.0, relative to source width)
   "center_y": float,   // recommended normalized crop center Y (0.0–1.0, relative to source height)
-  "coverage": float,   // recommended target_coverage for compute_crop (0.3–0.6; lower = looser crop)
+  "coverage": float,   // recommended target_coverage for compute_crop (0.3–0.5; lower = looser crop)
   "errors": ["critical issues"],
   "warnings": ["minor issues"],
   "suggestions": ["improvement suggestions"]
@@ -926,7 +926,7 @@ Respond with ONLY a JSON object:
 
     return GeminiCropPlanResult(
         recommended_center=(0.5, 0.5),
-        recommended_coverage=0.45,
+        recommended_coverage=0.35,
         errors=[f"Gemini crop planning failed: {last_error}"],
         raw_response=(response.text if response and response.text else ""),
     )

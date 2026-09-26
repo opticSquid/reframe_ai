@@ -431,8 +431,8 @@ def build_crop_trajectory(
                     # Asymmetric padding to include shoulders and headroom.
                     # MediaPipe BlazeFace bboxes are face-only (forehead to chin).
                     pad_x = 0.5       # 25% each side for shoulders
-                    pad_y_top = 0.4   # 40% above face for hair/headroom
-                    pad_y_bottom = 0.6  # 60% below face for chin/shoulders
+                    pad_y_top = 0.5   # 50% above face for hair/headroom (was 0.4)
+                    pad_y_bottom = 0.5  # 50% below face for chin/shoulders (was 0.6)
                     scaled_w = int(round(fw * (1 + pad_x)))
                     scaled_h = int(round(fh * (1 + pad_y_top + pad_y_bottom)))
                     scaled_x = max(0, fx - int(pad_x * fw / 2))
