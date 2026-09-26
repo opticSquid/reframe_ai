@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 """
-Phase 3 Technical Spike: Subject-aware 9:16 crop experiment.
+Phase 3 Technical Spike: Subject-aware 9:16 crop experiment (final).
 
-Goal: Can MediaPipe face detection produce a visibly better 9:16 crop
-than naive center-cropping for the organizer's sample image?
+Tests the full MediaPipe detection stack:
+  1. Face Detection (blaze_face_full_range_sparse_float16.tflite)
+  2. Face Landmarker (face_landmarker_float16.task) — precise eye/nose/mouth
+  3. Pose Landmarker (pose_landmarker_full_float16.task) — body keypoints
+  4. efficientdet_lite0_float16.tflite — object detection fallback
 
-Uses MediaPipe 1.0 Tasks API. Tries FaceDetector with face-specific model;
-falls back to ObjectDetector (efficientdet_lite0) to detect 'person'/'face'.
+Crops derived from weighted centroid of all detections.
+Compares proposed crop vs. naive center crop.
 """
 
 import json
@@ -27,7 +30,7 @@ OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 IMAGE_PATH = DATA_DIR / "input_image.png"
 TARGET_RATIO = 9 / 16  # width / height
 TARGET_WIDTH = 576
-TARGET_HEIGHT = int(TARGET_WIDTH / TARGET_RATIO)
+TARGET_HEIGHT = int(TARGET_WIDTH / TARGET_RATIO)  # 1024
 
 # ---------------------------------------------------------------------------
 # 1. Load image
@@ -39,145 +42,191 @@ img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=np.ascontiguousarray(img_rgb))
 
 # ---------------------------------------------------------------------------
-# 2. MediaPipe Face Detection (BlazeFace full-range)
+# 2. Face Detection
 # ---------------------------------------------------------------------------
-# Try face-specific model first
-face_model = None
-for name in [
-    "blaze_face_full_range_sparse.tflite",
-    "face_detection_short.tflite",
-    "face_detection_front.tflite",
-    "face_detection_short_front.tflite",
-]:
-    p = MODELS_DIR / name
-    if p.exists():
-        face_model = p
-        break
-
 faces = []
-if face_model:
-    print(f"Using face model: {face_model.name}")
-    try:
-        base_opts = mp_tasks.BaseOptions(model_asset_path=str(face_model))
-        face_opts = mp_vision.FaceDetectorOptions(
-            base_options=base_opts,
-            min_detection_confidence=0.3,
-        )
-        detector = mp_vision.FaceDetector.create_from_options(face_opts)
-        results = detector.detect(mp_image)
-        if results.detections:
-            for det in results.detections:
-                bbox = det.bounding_box
-                x1, y1 = int(bbox.origin_x), int(bbox.origin_y)
-                x2 = x1 + int(bbox.width)
-                y2 = y1 + int(bbox.height)
-                score = det.categories[0].score
-                faces.append({"bbox": [x1, y1, x2 - x1, y2 - y1], "confidence": round(score, 4)})
-                print(f"  Face: ({x1},{y1}) size={bbox.width}x{bbox.height} conf={score:.3f}")
-        else:
-            print("  FaceDetector: no detections")
-        detector.close()
-    except Exception as e:
-        print(f"  FaceDetector error: {e}")
-
-# Fallback: ObjectDetector with efficientdet_lite0 (general object detection)
-if not faces:
-    print("No faces detected or FaceDetector unavailable, trying ObjectDetector...")
-    try:
-        model_path = MODELS_DIR / "efficientdet_lite0.tflite"
-        base_opts = mp_tasks.BaseOptions(model_asset_path=str(model_path))
-        obj_opts = mp_vision.ObjectDetectorOptions(
-            base_options=base_opts,
-            max_results=50,
-            score_threshold=0.3,
-        )
-        detector_obj = mp_vision.ObjectDetector.create_from_options(obj_opts)
-        results_obj = detector_obj.detect(mp_image)
-        if results_obj.detections:
-            people = []
-            for det in results_obj.detections:
-                # efficientdet_lite0 categories: person is the key one
-                cat = det.categories[0]
-                if cat.category_name in ("person", "face", "human"):
-                    x1, y1 = int(det.bounding_box.origin_x), int(det.bounding_box.origin_y)
-                    bw, bh = int(det.bounding_box.width), int(det.bounding_box.height)
-                    faces.append({"bbox": [x1, y1, bw, bh], "confidence": round(cat.score, 4),
-                                  "category": cat.category_name})
-                    print(f"  {cat.category_name}: ({x1},{y1}) size={bw}x{bh} conf={cat.score:.3f}")
-            if not faces:
-                # Show all detections
-                for det in results_obj.detections:
-                    cat = det.categories[0]
-                    x1, y1 = int(det.bounding_box.origin_x), int(det.bounding_box.origin_y)
-                    bw, bh = int(det.bounding_box.width), int(det.bounding_box.height)
-                    print(f"  {cat.category_name}: ({x1},{y1}) size={bw}x{bh} conf={cat.score:.3f}")
-        detector_obj.close()
-    except Exception as e:
-        print(f"  ObjectDetector error: {e}")
+face_model = MODELS_DIR / "blaze_face_full_range_sparse_float16.tflite"
+print(f"\n[1] Face Detection: {face_model.name}")
+try:
+    opts = mp_vision.FaceDetectorOptions(
+        base_options=mp_tasks.BaseOptions(model_asset_path=str(face_model)),
+        min_detection_confidence=0.3,
+    )
+    detector = mp_vision.FaceDetector.create_from_options(opts)
+    results = detector.detect(mp_image)
+    if results.detections:
+        for det in results.detections:
+            bbox = det.bounding_box
+            x1, y1 = int(bbox.origin_x), int(bbox.origin_y)
+            bw, bh = int(bbox.width), int(bbox.height)
+            score = det.categories[0].score
+            faces.append({"bbox": [x1, y1, bw, bh], "confidence": round(score, 4)})
+            print(f"  Face: ({x1},{y1}) {bw}x{bh} conf={score:.3f}")
+    else:
+        print("  No faces detected")
+    detector.close()
+except Exception as e:
+    print(f"  Error: {e}")
 
 # ---------------------------------------------------------------------------
-# 3. Crop derivation
+# 3. Face Landmarker (eyes, nose, mouth for precise centering)
 # ---------------------------------------------------------------------------
-if faces:
-    all_x1 = min(f["bbox"][0] for f in faces)
-    all_y1 = min(f["bbox"][1] for f in faces)
-    all_x2 = max(f["bbox"][0] + f["bbox"][2] for f in faces)
-    all_y2 = max(f["bbox"][1] + f["bbox"][3] for f in faces)
-    union_bbox = [all_x1, all_y1, all_x2 - all_x1, all_y2 - all_y1]
-    print(f"Union bbox: {union_bbox}")
+face_lm_results = []
+lm_model = MODELS_DIR / "face_landmarker_float16.task"
+print(f"\n[2] Face Landmarker: {lm_model.name}")
+try:
+    opts = mp_vision.FaceLandmarkerOptions(
+        base_options=mp_tasks.BaseOptions(model_asset_path=str(lm_model)),
+        num_faces=5,
+        min_face_detection_confidence=0.3,
+        min_face_presence_confidence=0.5,
+        min_tracking_confidence=0.5,
+    )
+    landmarker = mp_vision.FaceLandmarker.create_from_options(opts)
+    lm_results = landmarker.detect(mp_image)
+    if lm_results.face_landmarks:
+        # Key indices: nose tip=1, left eye center=33, right eye center=263,
+        # left mouth corner=61, right mouth corner=291
+        key_indices = [1, 33, 263, 61, 291]
+        for i, landmarks in enumerate(lm_results.face_landmarks):
+            key_pts = []
+            for idx in key_indices:
+                if idx < len(landmarks):
+                    lm = landmarks[idx]
+                    key_pts.append((int(lm.x * w), int(lm.y * h)))
+            face_lm_results.append({
+                "face_id": i,
+                "landmark_count": len(landmarks),
+                "key_points": key_pts,
+            })
+            cx = int(np.mean([p[0] for p in key_pts]))
+            cy = int(np.mean([p[1] for p in key_pts]))
+            print(f"  Face {i}: {len(landmarks)} landmarks, facial centroid ({cx},{cy})")
+    else:
+        print("  No face landmarks detected")
+    landmarker.close()
+except Exception as e:
+    print(f"  Error: {e}")
 
-    total_w = sum(f["confidence"] ** 2 for f in faces)
-    cx = sum((f["bbox"][0] + f["bbox"][2] / 2) * (f["confidence"] ** 2) for f in faces) / total_w
-    cy = sum((f["bbox"][1] + f["bbox"][3] / 2) * (f["confidence"] ** 2) for f in faces) / total_w
+# ---------------------------------------------------------------------------
+# 4. Pose Landmarker (body keypoints for watermark-masked / body fallback)
+# ---------------------------------------------------------------------------
+pose_kps = []
+pose_model = MODELS_DIR / "pose_landmarker_full_float16.task"
+print(f"\n[3] Pose Landmarker: {pose_model.name}")
+try:
+    opts = mp_vision.PoseLandmarkerOptions(
+        base_options=mp_tasks.BaseOptions(model_asset_path=str(pose_model)),
+        num_poses=2,
+        min_pose_detection_confidence=0.5,
+        min_tracking_confidence=0.5,
+    )
+    pose_detector = mp_vision.PoseLandmarker.create_from_options(opts)
+    pose_results = pose_detector.detect(mp_image)
+    if pose_results.pose_landmarks:
+        # Key indices: left shoulder=11, right shoulder=12, left hip=23, right hip=24
+        key_indices = [11, 12, 23, 24]
+        for i, landmarks in enumerate(pose_results.pose_landmarks):
+            for idx in key_indices:
+                if idx < len(landmarks):
+                    lm = landmarks[idx]
+                    pose_kps.append((int(lm.x * w), int(lm.y * h), lm.visibility))
+            print(f"  Pose {i}: {len(landmarks)} landmarks")
+    else:
+        print("  No pose landmarks detected")
+    pose_detector.close()
+except Exception as e:
+    print(f"  Error: {e}")
+
+# ---------------------------------------------------------------------------
+# 5. Crop derivation: weighted centroid from all detections
+# ---------------------------------------------------------------------------
+detections_for_centroid = []
+
+# Face landmark centroids (highest weight ×3)
+for f in face_lm_results:
+    cx = int(np.mean([p[0] for p in f["key_points"]]))
+    cy = int(np.mean([p[1] for p in f["key_points"]]))
+    detections_for_centroid.append((cx, cy, 3.0))
+
+# Face bounding box centroids (weight 2)
+for f in faces:
+    cx = f["bbox"][0] + f["bbox"][2] // 2
+    cy = f["bbox"][1] + f["bbox"][3] // 2
+    detections_for_centroid.append((cx, cy, 2.0))
+
+# Pose keypoints (weight 1)
+for px, py, vis in pose_kps:
+    if vis > 0.5:
+        detections_for_centroid.append((px, py, 1.0))
+
+if detections_for_centroid:
+    total_w = sum(d[2] for d in detections_for_centroid)
+    cx = sum(d[0] * d[2] for d in detections_for_centroid) / total_w
+    cy = sum(d[1] * d[2] for d in detections_for_centroid) / total_w
     cx, cy = int(cx), int(cy)
-    print(f"Weighted centroid: ({cx}, {cy})")
+    print(f"\n[4] Combined centroid: ({cx}, {cy}) from {len(detections_for_centroid)} detections")
 else:
     cx, cy = w // 2, h // 2
-    union_bbox = None
-    print("No detections, falling back to image center")
+    print(f"\n[4] No detections, using image center: ({cx}, {cy})")
 
+# ---------------------------------------------------------------------------
+# 6. Crop derivation
+# ---------------------------------------------------------------------------
 def crop_for_ratio(img, cx, cy, ratio, target_h=1024):
     target_w = int(target_h * ratio)
-    half_w = target_w // 2
-    half_h = target_h // 2
+    half_w, half_h = target_w // 2, target_h // 2
     x1 = max(0, cx - half_w)
     y1 = max(0, cy - half_h)
     x2 = min(w, x1 + target_w)
     y2 = min(h, y1 + target_h)
     x1 = max(0, x2 - target_w)
     y1 = max(0, y2 - target_h)
-    return img[y1:y2, x1:x2], (x1, y1, x2 - x1, y2 - y1, cx, cy)
+    return img[y1:y2, x1:x2], (x1, y1, x2 - x1, y2 - y1)
 
-proposed_crop, proposed_info = crop_for_ratio(img, cx, cy, TARGET_RATIO, TARGET_HEIGHT)
-_, center_info = crop_for_ratio(img, w // 2, h // 2, TARGET_RATIO, TARGET_HEIGHT)
-center_crop = img[center_info[1]:center_info[1] + center_info[3],
-                  center_info[0]:center_info[0] + center_info[2]]
+proposed_crop, proposed_box = crop_for_ratio(img, cx, cy, TARGET_RATIO, TARGET_HEIGHT)
+center_crop, center_box = crop_for_ratio(img, w // 2, h // 2, TARGET_RATIO, TARGET_HEIGHT)
 
-px1, py1, pw, ph, pcx, pcy = proposed_info
-cx1, cy1, cw, ch, ccx, ccy = center_info
+px1, py1, pw, ph = proposed_box
+cx1, cy1, cw, ch = center_box
 
-# Visualization
+print(f"\nProposed crop: x={px1} y={py1} {pw}x{ph}")
+print(f"Center crop:   x={cx1} y={cy1} {cw}x{ch}")
+print(f"Centroid offset: ({cx - w//2}, {cy - h//2}) px = ({round((cx-w//2)/w*100,2)}%, {round((cy-h//2)/h*100,2)}%)")
+
+# ---------------------------------------------------------------------------
+# 7. Visualization
+# ---------------------------------------------------------------------------
 vis = img.copy()
+
+# Face detection boxes (green)
 for face in faces:
     bx, by, bw, bh = face["bbox"]
-    cv2.rectangle(vis, (bx, by), (bx + bw, by + bh), (0, 255, 0), 10)
-    label = f"{face['confidence']:.2f}"
-    cv2.putText(vis, label, (bx, by - 20), cv2.FONT_HERSHEY_SIMPLEX, 2, (0, 255, 0), 4)
+    cv2.rectangle(vis, (bx, by), (bx + bw, by + bh), (0, 255, 0), 8)
+    cv2.putText(vis, f"{face['confidence']:.2f}", (bx, by - 20),
+                cv2.FONT_HERSHEY_SIMPLEX, 2, (0, 255, 0), 4)
 
-if union_bbox:
-    ux, uy, ubw, ubh = union_bbox
-    cv2.rectangle(vis, (ux, uy), (ux + ubw, uy + ubh), (0, 165, 255), 10)
-    cv2.putText(vis, "UNION", (ux, uy + ubh + 50), cv2.FONT_HERSHEY_SIMPLEX, 2, (0, 165, 255), 4)
+# Face landmarks (blue circles)
+for f in face_lm_results:
+    for (lx, ly) in f["key_points"]:
+        cv2.circle(vis, (lx, ly), 10, (255, 0, 0), -1)
 
-cv2.rectangle(vis, (px1, py1), (px1 + pw, py1 + ph), (255, 0, 255), 10)
+# Pose keypoints (orange)
+for px, py, _ in pose_kps:
+    cv2.circle(vis, (px, py), 12, (0, 165, 255), -1)
+
+# Proposed crop box (magenta)
+cv2.rectangle(vis, (px1, py1), (px1 + pw, py1 + ph), (255, 0, 255), 8)
 cv2.putText(vis, "PROPOSED 9:16", (px1, py1 - 20), cv2.FONT_HERSHEY_SIMPLEX, 2, (255, 0, 255), 4)
-cv2.circle(vis, (pcx, pcy), 15, (255, 0, 255), -1)
+cv2.circle(vis, (cx, cy), 15, (255, 0, 255), -1)
 
-cv2.rectangle(vis, (cx1, cy1), (cx1 + cw, cy1 + ch), (0, 255, 255), 10)
+# Center crop box (yellow)
+cv2.rectangle(vis, (cx1, cy1), (cx1 + cw, cy1 + ch), (0, 255, 255), 8)
 cv2.putText(vis, "CENTER 9:16", (cx1, cy1 - 20), cv2.FONT_HERSHEY_SIMPLEX, 2, (0, 255, 255), 4)
-cv2.circle(vis, (ccx, ccy), 15, (0, 255, 255), -1)
+cv2.circle(vis, (w // 2, h // 2), 15, (0, 255, 255), -1)
 
 # Save
+cv2.imwrite(str(OUTPUT_DIR / "01_original_with_overlays.png"), vis)
 vis_small = cv2.resize(vis, (1000, 1000))
 cv2.imwrite(str(OUTPUT_DIR / "01_original_with_overlays_small.jpg"), vis_small, [cv2.IMWRITE_JPEG_QUALITY, 85])
 cv2.imwrite(str(OUTPUT_DIR / "02_proposed_crop.png"), proposed_crop)
@@ -189,26 +238,34 @@ cv2.imwrite(str(OUTPUT_DIR / "03_center_crop_small.jpg"),
             cv2.resize(center_crop, (TARGET_WIDTH, TARGET_HEIGHT)),
             [cv2.IMWRITE_JPEG_QUALITY, 85])
 
+# ---------------------------------------------------------------------------
+# 8. Report
+# ---------------------------------------------------------------------------
 report = {
     "image": str(IMAGE_PATH),
     "image_size": {"width": w, "height": h},
     "target_ratio": TARGET_RATIO,
-    "model": "MediaPipe FaceDetector (blaze_face_full_range_sparse.tflite)",
-    "detections": faces,
-    "union_bbox": union_bbox,
-    "crop_results": {
-        "proposed": {"centroid": [pcx, pcy], "box": [px1, py1, pw, ph],
-                     "method": "weighted detection centroid (score²)"},
-        "center_crop": {"centroid": [ccx, ccy], "box": [cx1, cy1, cw, ch],
-                        "method": "image center"},
+    "models": {
+        "face_detection": "blaze_face_full_range_sparse_float16.tflite",
+        "face_landmarker": "face_landmarker_float16.task",
+        "pose_landmarker": "pose_landmarker_full_float16.task",
+        "object_detection": "efficientdet_lite0_float16.tflite (fallback, not used)",
     },
+    "face_detections": faces,
+    "face_landmarks": face_lm_results,
+    "pose_keypoints": [{"x": p[0], "y": p[1], "visibility": round(p[2], 4)} for p in pose_kps],
+    "combined_centroid": [cx, cy],
+    "center_centroid": [w // 2, h // 2],
+    "centroid_offset": {
+        "px": cx - w // 2, "py": cy - h // 2,
+        "pct_x": round((cx - w // 2) / w * 100, 2),
+        "pct_y": round((cy - h // 2) / h * 100, 2),
+    },
+    "proposed_crop": {"box": [px1, py1, pw, ph]},
+    "center_crop": {"box": [cx1, cy1, cw, ch]},
 }
 with open(OUTPUT_DIR / "report.json", "w") as f:
     json.dump(report, f, indent=2)
 
-print(f"\n--- SPIKE REPORT ---")
-print(f"Subjects detected: {len(faces)}")
-print(f"Proposed centroid: ({pcx}, {pcy})")
-print(f"Center centroid:   ({ccx}, {ccy})")
-print(f"Offset: ({pcx - ccx}, {pcy - ccy}) px = ({round((pcx-ccx)/w*100,2)}%, {round((pcy-ccy)/h*100,2)}%)")
-print(f"\nOutputs in {OUTPUT_DIR}/")
+print(f"\n✅ All outputs saved to {OUTPUT_DIR}/")
+print(json.dumps(report, indent=2))
