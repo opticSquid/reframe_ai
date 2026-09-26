@@ -296,7 +296,14 @@ export default function Home() {
         }
       }
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Connection failed");
+      const backendUrl = BACKEND_URL;
+      setError(
+        err instanceof Error && err.message === "Failed to fetch"
+          ? `Cannot reach backend server at ${backendUrl}. Is it running? Start with: uvicorn src.main:app --host 0.0.0.0 --port 5000`
+          : err instanceof Error
+          ? err.message
+          : "Connection failed"
+      );
       setStep("upload");
     }
   }, []);
