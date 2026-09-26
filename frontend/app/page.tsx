@@ -21,13 +21,16 @@ function isError(e: StreamEvent): e is ErrorEvent {
 
 // Convert absolute output path to a backend-served URL
 function toStaticUrl(absolutePath: string): string {
-  // Paths look like /home/.../output/uploads/<uuid>/... or output/...
-  // Backend serves /output/ → OUTPUT_DIR
   const idx = absolutePath.indexOf("output/");
+  let path: string;
   if (idx >= 0) {
-    return `${BACKEND_URL}/output/${absolutePath.slice(idx + "output/".length)}`;
+    path = absolutePath.slice(idx + "output/".length);
+  } else {
+    path = absolutePath.split("/").pop() || "";
   }
-  return `${BACKEND_URL}/output/${absolutePath.split("/").pop()}`;
+  // Encode each path segment to handle special chars (?, #, spaces, etc.)
+  const encodedPath = path.split("/").map(encodeURIComponent).join("/");
+  return `${BACKEND_URL}/output/${encodedPath}`;
 }
 
 const UploadIcon = () => (
@@ -296,7 +299,14 @@ export default function Home() {
         }
       }
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Connection failed");
+      const backendUrl = BACKEND_URL;
+      setError(
+        err instanceof Error && err.message === "Failed to fetch"
+          ? `Cannot reach backend server at ${backendUrl}. Is it running? Start with: uvicorn src.main:app --host 0.0.0.0 --port 5000`
+          : err instanceof Error
+          ? err.message
+          : "Connection failed"
+      );
       setStep("upload");
     }
   }, []);

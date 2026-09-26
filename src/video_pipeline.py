@@ -24,6 +24,8 @@ from .config import (
     VIDEO_SAMPLE_FPS,
     VIDEO_LANDMARK_FPS,
     REEL_ASPECT_RATIO,
+    VIDEO_SEGMENT_DURATION_SEC,
+    VIDEO_SEGMENT_MAX_RETRIES,
 )
 from .video_ingestion import VideoMetadata, extract_video_metadata
 from .video_perception import (
@@ -38,7 +40,12 @@ from .video_speaker import (
     infer_active_speaker_timeline, build_crop_trajectory,
 )
 from .video_rendering import render_vertical_video
-from .video_review import gemini_review_video, VideoReviewResult
+from .video_segment import find_best_segment, BestSegment
+from .video_review import (
+    gemini_review_video, VideoReviewResult,
+    gemini_plan_crop, GeminiCropPlanResult,
+    evaluate_segment_quality, SegmentQuality,
+)
 from .validator import validate_asset
 
 
@@ -65,6 +72,12 @@ class VideoPipelineResult:
     manifest: dict[str, Any] = field(default_factory=dict)
     ai_review: VideoReviewResult | None = None
     still_paths: list[str] = field(default_factory=list)
+    segment_start: float = 0.0
+    segment_end: float = 0.0
+    best_segment: BestSegment | None = None
+    crop_plan: GeminiCropPlanResult | None = None
+    segment_quality: SegmentQuality | None = None
+    pipeline_attempts: int = 1
 
     def to_summary(self) -> dict[str, Any]:
         return {
@@ -102,6 +115,33 @@ class VideoPipelineResult:
                 }
                 if self.ai_review else None
             ),
+            "segment": {
+                "start": self.segment_start,
+                "end": self.segment_end,
+                "duration": self.segment_end - self.segment_start,
+            },
+            "segment_quality": (
+                {
+                    "passed": self.segment_quality.passed,
+                    "face_coverage": self.segment_quality.face_coverage,
+                    "audio_coverage": self.segment_quality.audio_coverage,
+                    "shot_retention": self.segment_quality.shot_retention,
+                    "num_speakers": self.segment_quality.num_speakers,
+                    "trajectory_validity": self.segment_quality.trajectory_validity,
+                    "errors": self.segment_quality.errors,
+                    "warnings": self.segment_quality.warnings,
+                }
+                if self.segment_quality else None
+            ),
+            "crop_plan": (
+                {
+                    "center": list(self.crop_plan.recommended_center) if self.crop_plan and self.crop_plan.recommended_center else None,
+                    "coverage": self.crop_plan.recommended_coverage if self.crop_plan else None,
+                    "suggestions": self.crop_plan.suggestions if self.crop_plan else [],
+                }
+                if self.crop_plan else None
+            ),
+            "pipeline_attempts": self.pipeline_attempts,
         }
 
 
@@ -258,72 +298,234 @@ def process_video_to_reel(
         track_mars=track_mars,
     )
 
-    # ------------------------------------------------------------------
-    # Stage 6: Crop trajectory
-    # ------------------------------------------------------------------
-    trajectory = build_crop_trajectory(
-        tracks=tracks,
-        segments=segments,
-        total_duration=metadata.duration_sec,
-        total_frames=metadata.total_frames,
-        fps=metadata.fps,
-        source_width=metadata.width,
-        source_height=metadata.height,
-        target_ratio=REEL_ASPECT_RATIO,
-        target_coverage=0.65,
-        smoothing_alpha=0.3,
-    )
     t_speaker_1 = time.perf_counter()
 
     # ------------------------------------------------------------------
-    # Stage 7: Render
+    # Stage 6: Find best segment (if video > 30s, trim to best segment)
     # ------------------------------------------------------------------
     if progress_callback:
-        progress_callback("Render: generating vertical reel and stills", 70)
+        progress_callback("Segment: finding best clip to feature", 60)
+    if metadata.duration_sec <= VIDEO_SEGMENT_DURATION_SEC:
+        # Video is short enough — use entire video as the segment
+        seg_start = 0.0
+        seg_end = metadata.duration_sec
+        best_segment = BestSegment(
+            start=0.0,
+            end=metadata.duration_sec,
+            score=1.0,
+        )
+    else:
+        best_segment = find_best_segment(
+            video_path=video_path,
+            metadata=metadata,
+            segment_duration=VIDEO_SEGMENT_DURATION_SEC,
+        )
+        seg_start = best_segment.start
+        seg_end = best_segment.end
+
+    # ------------------------------------------------------------------
+    # Stage 7: Gemini crop planning + render + review feedback loop
+    # ------------------------------------------------------------------
+    # This loop: get Gemini crop recommendations → build trajectory →
+    # render → evaluate (deterministic + Gemini review) → if not passing,
+    # adjust params and retry up to VIDEO_SEGMENT_MAX_RETRIES.
+    best_render_result: Any = None
+    best_trajectory: list[CropTrajectoryPoint] = []
+    best_quality: SegmentQuality | None = None
+    best_review: VideoReviewResult | None = None
+    best_crop_plan: GeminiCropPlanResult | None = None
+    best_seg_start = seg_start
+    best_seg_end = seg_end
+
+    last_render_path = ""
+    attempt = 0
     t_render_0 = time.perf_counter()
-
-    reel_path = str(video_reels_dir / f"{stem}_9_16.mp4")
-    debug_path = str(video_reels_dir / f"{stem}_debug.mp4") if generate_debug else None
-
-    render_result = render_vertical_video(
-        video_path=video_path,
-        trajectory=trajectory,
-        tracks=tracks,
-        output_path=reel_path,
-        target_ratio=REEL_ASPECT_RATIO,
-        source_width=metadata.width,
-        source_height=metadata.height,
-        fps=metadata.fps,
-        total_frames=metadata.total_frames,
-        generate_debug=generate_debug,
-        debug_path=debug_path,
-        stills_dir=stills_dir,
-    )
-
     t_render_1 = time.perf_counter()
-
-    # ------------------------------------------------------------------
-    # Stage 8: AI Visual Review (post-rendering Gemini critique)
-    # ------------------------------------------------------------------
-    if progress_callback:
-        progress_callback("Review: Gemini assessing framing quality", 85)
     t_review_0 = time.perf_counter()
-    ai_review = gemini_review_video(
-        original_video_path=video_path,
-        reel_video_path=render_result.reel_path,
-        trajectory=trajectory,
-        segments=segments,
-        shot_boundaries=shot_bounds,
-        metadata=metadata,
-        max_review_frames=12,
-    )
     t_review_1 = time.perf_counter()
+    for attempt in range(VIDEO_SEGMENT_MAX_RETRIES):
+        if progress_callback:
+            progress_callback(
+                f"Plan: Gemini crop planning (attempt {attempt + 1}/{VIDEO_SEGMENT_MAX_RETRIES})",
+                64 + attempt * 3,
+            )
+
+        # On retry, adjust segment boundaries or crop width based on feedback
+        cur_seg_start = best_seg_start
+        cur_seg_end = best_seg_end
+        cur_tc = 0.30  # default target_coverage (looser crop to keep faces in frame)
+
+        if attempt > 0:
+            # If review said something was missing, shift the segment
+            if best_review is not None and best_review.errors:
+                shift = 3.0
+                sign = -1 if attempt % 2 == 1 else 1
+                cur_seg_start = max(0.0, cur_seg_start + sign * shift)
+                cur_seg_end = min(metadata.duration_sec, cur_seg_start + VIDEO_SEGMENT_DURATION_SEC)
+                best_seg_start = cur_seg_start
+                best_seg_end = cur_seg_end
+
+        # Get Gemini crop plan (incorporating previous review if retrying)
+        crop_plan = gemini_plan_crop(
+            video_path=video_path,
+            metadata=metadata,
+            segment_start=cur_seg_start,
+            segment_end=cur_seg_end,
+            shot_boundaries=shot_bounds,
+            segments=segments,
+            previous_review=best_review,
+        )
+        if crop_plan:
+            best_crop_plan = crop_plan
+
+        ic = (
+            best_crop_plan.recommended_center
+            if best_crop_plan and best_crop_plan.recommended_center
+            else None
+        )
+        if best_crop_plan and best_crop_plan.recommended_coverage:
+            cur_tc = best_crop_plan.recommended_coverage
+        if attempt > 0:
+            # Widen crop to capture more context on retry
+            cur_tc = max(0.20, cur_tc - 0.05 * attempt)
+
+        # Build trajectory for full video, then slice to segment
+        trajectory = build_crop_trajectory(
+            tracks=tracks,
+            segments=segments,
+            total_duration=metadata.duration_sec,
+            total_frames=metadata.total_frames,
+            fps=metadata.fps,
+            source_width=metadata.width,
+            source_height=metadata.height,
+            target_ratio=REEL_ASPECT_RATIO,
+            target_coverage=cur_tc,
+            smoothing_alpha=0.2,
+            initial_center=ic,
+        )
+
+        # Slice trajectory to segment (absolute times preserved)
+        start_frame = int(round(cur_seg_start * metadata.fps))
+        end_frame = int(round(cur_seg_end * metadata.fps))
+        segment_trajectory = (
+            trajectory[start_frame:end_frame + 1]
+            if trajectory and start_frame < len(trajectory)
+            else []
+        )
+
+        # Slice tracks for debug overlay (only bboxes within segment)
+        segment_tracks = _slice_tracks_for_segment(
+            tracks, cur_seg_start, cur_seg_end, metadata.fps
+        )
+
+        # Render
+        if progress_callback:
+            progress_callback(
+                f"Render: generating reel for segment "
+                f"[{cur_seg_start:.1f}s, {cur_seg_end:.1f}s]",
+                76,
+            )
+        t_render_0 = time.perf_counter()
+
+        reel_path = str(video_reels_dir / f"{stem}_9_16.mp4")
+        debug_path = str(video_reels_dir / f"{stem}_debug.mp4") if generate_debug else None
+
+        render_result = render_vertical_video(
+            video_path=video_path,
+            trajectory=segment_trajectory,
+            tracks=segment_tracks,
+            output_path=reel_path,
+            target_ratio=REEL_ASPECT_RATIO,
+            source_width=metadata.width,
+            source_height=metadata.height,
+            fps=metadata.fps,
+            total_frames=len(segment_trajectory),
+            generate_debug=generate_debug,
+            debug_path=debug_path,
+            stills_dir=stills_dir,
+            start_time=cur_seg_start,
+            end_time=cur_seg_end,
+        )
+        last_render_path = render_result.reel_path
+        t_render_1 = time.perf_counter()
+
+        # Evaluate segment quality (deterministic metrics)
+        quality = evaluate_segment_quality(
+            metadata=metadata,
+            segment_start=cur_seg_start,
+            segment_end=cur_seg_end,
+            trajectory=segment_trajectory,
+            tracks=tracks,
+            segments=segments,
+            shot_boundaries=shot_bounds,
+        )
+
+        # Gemini review of the rendered output
+        if progress_callback:
+            progress_callback("Review: Gemini assessing framing quality", 88)
+        t_review_0 = time.perf_counter()
+        review = gemini_review_video(
+            original_video_path=video_path,
+            reel_video_path=render_result.reel_path,
+            trajectory=segment_trajectory,
+            segments=segments,
+            shot_boundaries=shot_bounds,
+            metadata=metadata,
+            crop_plan=best_crop_plan,
+            max_review_frames=12,
+        )
+        t_review_1 = time.perf_counter()
+
+        # Track best result across all attempts
+        if best_render_result is None:
+            best_render_result = render_result
+            best_trajectory = segment_trajectory
+            best_quality = quality
+            best_review = review
+            best_seg_start = cur_seg_start
+            best_seg_end = cur_seg_end
+        else:
+            # Replace if current attempt is strictly better
+            curr_passed = quality.passed and (review.passed if review else True)
+            best_passed = (best_quality.passed if best_quality else False) and (best_review.passed if best_review else True)
+            if curr_passed and not best_passed:
+                best_render_result = render_result
+                best_trajectory = segment_trajectory
+                best_quality = quality
+                best_review = review
+                best_seg_start = cur_seg_start
+                best_seg_end = cur_seg_end
+            elif curr_passed == best_passed:
+                cur_score = review.score if review else 0
+                best_score = best_review.score if best_review else 0
+                if cur_score > best_score:
+                    best_render_result = render_result
+                    best_trajectory = segment_trajectory
+                    best_quality = quality
+                    best_review = review
+                    best_seg_start = cur_seg_start
+                    best_seg_end = cur_seg_end
+
+        # Check pass conditions — stop if both deterministic metrics
+        # and Gemini review pass
+        det_passed = quality.passed
+        ai_passed = review.passed if review else True
+        if det_passed and ai_passed:
+            break
+
+    # Use best results from the loop
+    render_result = best_render_result
+    trajectory = best_trajectory
+    segment_quality = best_quality
+    ai_review = best_review
+    seg_start = best_seg_start
+    seg_end = best_seg_end
 
     # ------------------------------------------------------------------
-    # Stage 9: Validation
+    # Stage 8: Validation
     # ------------------------------------------------------------------
     if progress_callback:
-        progress_callback("Validation: checking against platform spec", 95)
+        progress_callback("Validation: checking against platform spec", 96)
     manifest = _build_video_manifest(
         video_path=video_path,
         stem=stem,
@@ -334,6 +536,8 @@ def process_video_to_reel(
         reel_path=render_result.reel_path,
         still_path=render_result.still_path,
     )
+    manifest["segment_start"] = seg_start
+    manifest["segment_end"] = seg_end
 
     validation = validate_asset(manifest, verify_files=True)
 
@@ -342,9 +546,11 @@ def process_video_to_reel(
     manifest_path.write_text(json.dumps(manifest, indent=2, default=str))
 
     # Save all debug artifacts
-    _save_artifacts(stem, output_dir, metadata, tracks, shot_bounds,
-                    speech_activity, segments, trajectory, render_result, validation,
-                    ai_review)
+    _save_artifacts(
+        stem, output_dir, metadata, tracks, shot_bounds,
+        speech_activity, segments, trajectory, render_result, validation,
+        ai_review,
+    )
 
     t_end = time.perf_counter()
 
@@ -368,7 +574,42 @@ def process_video_to_reel(
         manifest=manifest,
         ai_review=ai_review,
         still_paths=render_result.still_paths,
+        segment_start=seg_start,
+        segment_end=seg_end,
+        best_segment=best_segment,
+        crop_plan=best_crop_plan,
+        segment_quality=segment_quality,
+        pipeline_attempts=attempt + 1,
     )
+
+
+def _slice_tracks_for_segment(
+    tracks: list[TrackedPerson],
+    seg_start: float,
+    seg_end: float,
+    fps: float,
+) -> list[TrackedPerson]:
+    """Filter tracks' face bboxes to only those within the segment time range.
+
+    Used for debug overlay rendering on trimmed segments.
+    """
+    start_frame = int(round(seg_start * fps))
+    end_frame = int(round(seg_end * fps))
+    sliced: list[TrackedPerson] = []
+    for track in tracks:
+        bboxes = [
+            f for f in track.face_bboxes
+            if start_frame <= f.frame_idx <= end_frame
+        ]
+        if len(bboxes) >= 2:
+            sliced.append(TrackedPerson(
+                id=track.id,
+                face_bboxes=bboxes,
+                lost_count=track.lost_count,
+                last_mar=track.last_mar,
+                color=track.color,
+            ))
+    return sliced
 
 
 def _build_video_manifest(

@@ -6,6 +6,10 @@ If not set, Gemini-dependent features degrade gracefully with a user-friendly er
 
 import os
 from pathlib import Path
+from dotenv import load_dotenv
+
+# Load .env from project root if present
+load_dotenv()
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -66,6 +70,18 @@ INFERENCE_HEIGHT = 480
 MIN_FACE_CONFIDENCE = 0.5
 MIN_POSE_CONFIDENCE = 0.5
 MIN_OBJECT_CONFIDENCE = 0.4
+
+# ---------------------------------------------------------------------------
+# Video segment finding (best 30s window)
+# ---------------------------------------------------------------------------
+VIDEO_SEGMENT_DURATION_SEC = 30.0
+VIDEO_SEGMENT_MOTION_WEIGHT = 0.30
+VIDEO_SEGMENT_FACE_WEIGHT = 0.25
+VIDEO_SEGMENT_AUDIO_WEIGHT = 0.25
+VIDEO_SEGMENT_SHOT_WEIGHT = 0.20
+VIDEO_SEGMENT_MAX_RETRIES = 3
+VIDEO_SEGMENT_MIN_FACE_COVERAGE = 0.20  # min % of frames in segment with a face
+VIDEO_SEGMENT_MIN_AUDIO_COVERAGE = 0.15  # min % of frames with speech energy
 
 # ---------------------------------------------------------------------------
 # Gemini API
