@@ -49,6 +49,8 @@ def render_vertical_video(
     generate_debug: bool = True,
     debug_path: str | Path | None = None,
     stills_dir: str | Path | None = None,
+    start_time: float = 0.0,
+    end_time: float | None = None,
 ) -> RenderResult:
     """Render a vertical 9:16 video from the source using a dynamic crop trajectory.
 
@@ -71,21 +73,33 @@ def render_vertical_video(
         out_w = int(round(out_h * target_ratio))
 
     if total_frames is None:
-        total_frames = int(fps * (len(trajectory) / fps if trajectory else 1))
-        # Estimate from video
-        result = subprocess.run(
-            ["ffprobe", "-v", "quiet", "-select_streams", "v:0",
-             "-show_entries", "stream=nb_frames", "-of", "default=noprint_wrappers=1:nokey=1",
-             path],
-            capture_output=True, text=True, timeout=30,
-        )
-        if result.stdout.strip().isdigit():
-            total_frames = int(result.stdout.strip())
+        seg_duration = (end_time - start_time) if end_time is not None else None
+        if seg_duration is not None:
+            total_frames = int(round(seg_duration * fps))
         else:
-            total_frames = int(fps * source_height / source_width)  # fallback
+            total_frames = int(fps * (len(trajectory) / fps if trajectory else 1))
+            # Estimate from video
+            result = subprocess.run(
+                ["ffprobe", "-v", "quiet", "-select_streams", "v:0",
+                 "-show_entries", "stream=nb_frames", "-of", "default=noprint_wrappers=1:nokey=1",
+                 path],
+                capture_output=True, text=True, timeout=30,
+            )
+            if result.stdout.strip().isdigit():
+                tf_all = int(result.stdout.strip())
+                start_frame = int(round(start_time * fps))
+                if start_time > 0:
+                    total_frames = max(1, tf_all - start_frame)
+                else:
+                    total_frames = tf_all
+            else:
+                total_frames = int(fps * source_height / source_width)  # fallback
 
     # Ensure trajectory covers all frames
-    _ensure_trajectory(trajectory, total_frames, source_width, source_height, target_ratio, fps)
+    # Skip when trimming — the trajectory was built for the full video and
+    # will be sliced; _interpolate_trajectory handles any gaps.
+    if start_time <= 0 and end_time is None:
+        _ensure_trajectory(trajectory, total_frames, source_width, source_height, target_ratio, fps)
 
     # Build a frame-index → trajectory lookup
     traj_by_frame: dict[int, CropTrajectoryPoint] = {}
@@ -94,13 +108,16 @@ def render_vertical_video(
         traj_by_frame[fi] = point
 
     # ---- Decode → Crop → Encode pipeline (video only, no audio) ----
-    # Step 1: ffmpeg decode raw RGB frames
+    # Step 1: ffmpeg decode raw RGB frames (optionally trimmed to segment)
     decode_cmd = [
-        "ffmpeg", "-y", "-v", "quiet", "-i", path,
-        "-vf", "format=rgb24",
-        "-f", "rawvideo", "-pix_fmt", "rgb24",
-        "-",
+        "ffmpeg", "-y", "-v", "quiet",
     ]
+    if start_time > 0:
+        decode_cmd.extend(["-ss", str(start_time)])
+    decode_cmd.extend(["-i", path])
+    if end_time is not None:
+        decode_cmd.extend(["-t", str(end_time - start_time)])
+    decode_cmd.extend(["-vf", "format=rgb24", "-f", "rawvideo", "-pix_fmt", "rgb24", "-"])
     decoder = subprocess.Popen(decode_cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
 
     # Step 2: ffmpeg encode
@@ -165,8 +182,8 @@ def render_vertical_video(
             if len(raw) < frame_size:
                 break
 
-            t = frames_read / fps
-            frame_idx = frames_read
+            t = frames_read / fps + start_time
+            frame_idx = int(round(t * fps))
 
             # Get crop box for this frame
             point = traj_by_frame.get(frame_idx)
@@ -224,13 +241,19 @@ def render_vertical_video(
             debug_encoder.stdin.close()
             debug_encoder.wait()
 
-    # ---- Mux audio from original ----
+    # ---- Mux audio from original (trimmed to segment if applicable) ----
     mux_path = out_path
     final_path = out_path
-    audio_mux_cmd = [
+    audio_orig_cmd = [
         "ffmpeg", "-y", "-v", "quiet",
         "-i", encode_path,
-        "-i", path,
+    ]
+    if start_time > 0:
+        audio_orig_cmd.extend(["-ss", str(start_time)])
+    audio_orig_cmd.extend(["-i", path])
+    if end_time is not None:
+        audio_orig_cmd.extend(["-t", str(end_time - start_time)])
+    audio_mux_cmd = audio_orig_cmd + [
         "-c", "copy",
         "-map", "0:v:0", "-map", "1:a:0",
         "-movflags", "+faststart",
@@ -286,8 +309,9 @@ def render_vertical_video(
     else:
         # Fallback: extract middle frame at multiple ratios
         still_out = str(still_dir / f"{output_stem}_1_1.jpg")
+        mid_time = start_time + (frames_read / fps / 2) if end_time is None else start_time + (end_time - start_time) / 2
         subprocess.run([
-            "ffmpeg", "-y", "-v", "quiet", "-ss", str(total_frames / fps / 2),
+            "ffmpeg", "-y", "-v", "quiet", "-ss", str(mid_time),
             "-i", path, "-vframes", "1",
             "-vf", f"scale=1080:1080:force_original_aspect_ratio=decrease,"
                    f"pad=1080:1080:(ow-iw)/2:(oh-ih)/2",

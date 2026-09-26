@@ -25,6 +25,8 @@ from .config import (
     FACE_DETECTION_MODEL,
     MODELS_DIR,
     MIN_FACE_CONFIDENCE,
+    MIN_POSE_CONFIDENCE,
+    POSE_LANDMARKER_MODEL,
 )
 from .video_ingestion import VideoMetadata
 
@@ -56,6 +58,26 @@ class DetectedFace:
     width: int
     height: int
     confidence: float
+
+
+@dataclass
+class DetectedPose:
+    """A person pose detection on a single frame."""
+
+    frame_idx: int
+    timestamp: float
+    # 33 pose landmarks normalized (0–1) × (width, height) of detection frame
+    landmarks: list[tuple[float, float]]
+    nose: tuple[float, float] | None = None       # (x, y) normalized
+    left_shoulder: tuple[float, float] | None = None
+    right_shoulder: tuple[float, float] | None = None
+    left_hip: tuple[float, float] | None = None
+    right_hip: tuple[float, float] | None = None
+    left_knee: tuple[float, float] | None = None
+    right_knee: tuple[float, float] | None = None
+    left_ankle: tuple[float, float] | None = None
+    right_ankle: tuple[float, float] | None = None
+    bbox: tuple[float, float, float, float] | None = None  # (x, y, w, h) in pixels
 
 
 @dataclass
@@ -307,6 +329,7 @@ class VideoPerceiver:
         self._min_face_confidence = min_face_confidence
         self._face_detector: Any = None
         self._face_landmarker: Any = None
+        self._pose_landmarker: Any = None
         self._num_faces = num_faces
 
     def _get_face_detector(self) -> Any:
@@ -338,6 +361,24 @@ class VideoPerceiver:
         )
         self._face_landmarker = mp_vision.FaceLandmarker.create_from_options(opts)
         return self._face_landmarker
+
+    def _get_pose_landmarker(self) -> Any:
+        """Create or return the cached pose landmarker."""
+        if self._pose_landmarker is not None:
+            return self._pose_landmarker
+        from .config import POSE_LANDMARKER_MODEL
+        model_path = str(POSE_LANDMARKER_MODEL)
+        if not Path(model_path).exists():
+            return None
+        opts = mp_vision.PoseLandmarkerOptions(
+            base_options=mp_tasks.BaseOptions(model_asset_path=model_path),
+            num_poses=10,
+            min_pose_presence_confidence=0.5,
+            min_pose_tracking_confidence=0.5,
+            min_tracking_time_threshold_ms=100,
+        )
+        self._pose_landmarker = mp_vision.PoseLandmarker.create_from_options(opts)
+        return self._pose_landmarker
 
     def detect_faces(self, rgb_array: np.ndarray) -> list[DetectedFace]:
         """Run face detection on a frame. Returns empty list if model missing."""
@@ -417,6 +458,60 @@ class VideoPerceiver:
 
         return mars
 
+    def detect_poses(self, rgb_array: np.ndarray) -> list[DetectedPose]:
+        """Run pose detection on a frame. Returns empty list if model missing."""
+        landmarker = self._get_pose_landmarker()
+        if landmarker is None:
+            return []
+
+        h, w = rgb_array.shape[:2]
+        mp_img = mp.Image(image_format=mp.ImageFormat.SRGB, data=np.ascontiguousarray(rgb_array))
+        try:
+            results = landmarker.detect(mp_img)
+        except Exception:
+            return []
+
+        poses: list[DetectedPose] = []
+        # MediaPipe pose landmark indices
+        LANDMARK_NAMES = {
+            0: "nose", 11: "left_shoulder", 12: "right_shoulder",
+            23: "left_hip", 24: "right_hip", 25: "left_knee", 26: "right_knee",
+            27: "left_ankle", 28: "right_ankle",
+        }
+        if results.pose_landmarks:
+            for lm_list in results.pose_landmarks:
+                if len(lm_list) < 33:
+                    continue
+                landmarks = [(lm.x, lm.y) for lm in lm_list[:33]]
+                named = {LANDMARK_NAMES[i]: (lm_list[i].x, lm_list[i].y)
+                         for i in LANDMARK_NAMES if i < len(lm_list)}
+                # Compute bounding box from all landmarks
+                valid_x = [lm.x for lm in lm_list[:33] if lm.visibility > 0.5]
+                valid_y = [lm.y for lm in lm_list[:33] if lm.visibility > 0.5]
+                if valid_x and valid_y:
+                    bx = int(min(valid_x) * w)
+                    by = int(min(valid_y) * h)
+                    bw = int((max(valid_x) - min(valid_x)) * w)
+                    bh = int((max(valid_y) - min(valid_y)) * h)
+                    bbox = (float(bx), float(by), float(bw), float(bh))
+                else:
+                    bbox = None
+                poses.append(DetectedPose(
+                    frame_idx=0, timestamp=0.0,
+                    landmarks=landmarks,
+                    nose=named.get("nose"),
+                    left_shoulder=named.get("left_shoulder"),
+                    right_shoulder=named.get("right_shoulder"),
+                    left_hip=named.get("left_hip"),
+                    right_hip=named.get("right_hip"),
+                    left_knee=named.get("left_knee"),
+                    right_knee=named.get("right_knee"),
+                    left_ankle=named.get("left_ankle"),
+                    right_ankle=named.get("right_ankle"),
+                    bbox=bbox,
+                ))
+        return poses
+
     def close(self) -> None:
         """Release MediaPipe resources."""
         if self._face_detector is not None:
@@ -425,6 +520,9 @@ class VideoPerceiver:
         if self._face_landmarker is not None:
             self._face_landmarker.close()
             self._face_landmarker = None
+        if self._pose_landmarker is not None:
+            self._pose_landmarker.close()
+            self._pose_landmarker = None
 
 
 # ---------------------------------------------------------------------------

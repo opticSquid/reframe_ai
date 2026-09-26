@@ -304,14 +304,22 @@ def build_crop_trajectory(
     source_width: int,
     source_height: int,
     target_ratio: float = 9 / 16,
-    target_coverage: float = 0.65,
-    smoothing_alpha: float = 0.3,
+    target_coverage: float = 0.4,
+    smoothing_alpha: float = 0.2,
+    initial_center: tuple[float, float] | None = None,
 ) -> list[CropTrajectoryPoint]:
     """Build a per-frame crop trajectory driven by the active speaker timeline.
 
     Uses the existing ``compute_crop`` from ``src.cropper`` to compute the
     crop rectangle for the active speaker on each frame.  Smooths the
     crop center with an EMA to avoid jitter.
+
+    Parameters
+    ----------
+    initial_center
+        Optional (normalized_x, normalized_y) crop center to initialize the
+        EMA smoothing. When provided (e.g. from Gemini crop planning), the
+        trajectory starts from this center instead of the first face bbox.
     """
     from .cropper import Subject, compute_crop
 
@@ -380,6 +388,36 @@ def build_crop_trajectory(
     smooth_cx: float | None = None
     smooth_cy: float | None = None
 
+    # Initialize from Gemini-recommended center if provided
+    if initial_center is not None:
+        icx, icy = initial_center
+        smooth_cx = float(icx) * source_width
+        smooth_cy = float(icy) * source_height
+
+    # Fallback: if no tracks, use initial_center or center
+    if not tracks:
+        from .cropper import _center_crop
+        cr = _center_crop(source_width, source_height, target_ratio)
+        points: list[CropTrajectoryPoint] = []
+        for fi in range(total_frames):
+            t = fi / fps
+            cx = cr.x + cr.width / 2
+            cy = cr.y + cr.height / 2
+            if initial_center is not None:
+                icx, icy = initial_center
+                cx = float(icx) * source_width
+                cy = float(icy) * source_height
+                cr.x = max(0, min(int(round(cx - cr.width / 2)), source_width - cr.width))
+                cr.y = max(0, min(int(round(cy - cr.height / 2)), source_height - cr.height))
+            points.append(CropTrajectoryPoint(
+                time=t,
+                center_x=cx / source_width, center_y=cy / source_height,
+                crop_x=cr.x, crop_y=cr.y, crop_w=cr.width, crop_h=cr.height,
+                speaker_id=-1,
+                source_width=source_width, source_height=source_height,
+            ))
+        return points
+
     for fi in range(total_frames):
         t = fi / fps
         speaker_id = get_active_speaker(t)
@@ -390,13 +428,15 @@ def build_crop_trajectory(
                 bbox = predict_bbox(track.id, t)
                 if bbox is not None:
                     fx, fy, fw, fh = bbox
-                    # Create a Subject for the active speaker
-                    # Scale bbox slightly to ensure full face in frame
-                    pad = 0.2
-                    scaled_w = int(fw * (1 + pad))
-                    scaled_h = int(fh * (1 + pad))
-                    scaled_x = max(0, fx - int(pad * fw / 2))
-                    scaled_y = max(0, fy - int(pad * fh / 2))
+                    # Asymmetric padding to include shoulders and headroom.
+                    # MediaPipe BlazeFace bboxes are face-only (forehead to chin).
+                    pad_x = 0.5       # 25% each side for shoulders
+                    pad_y_top = 0.4   # 40% above face for hair/headroom
+                    pad_y_bottom = 0.6  # 60% below face for chin/shoulders
+                    scaled_w = int(round(fw * (1 + pad_x)))
+                    scaled_h = int(round(fh * (1 + pad_y_top + pad_y_bottom)))
+                    scaled_x = max(0, fx - int(pad_x * fw / 2))
+                    scaled_y = max(0, fy - int(pad_y_top * fh))
 
                     subject = Subject(
                         bbox=(float(scaled_x), float(scaled_y), float(scaled_w), float(scaled_h)),
@@ -410,13 +450,35 @@ def build_crop_trajectory(
                         target_ratio=target_ratio,
                         target_coverage=target_coverage,
                     )
-
+                    # Enforce minimum crop size to prevent excessive zoom-in
+                    # when the face is far from the camera. For a 9:16 portrait
+                    # crop from a 16:9 source, enforce at least 35% of source
+                    # height (≈2.8x max zoom from the full-height crop).
+                    if target_ratio < 1.0 and cr.height < int(source_height * 0.35):
+                        cr.height = int(source_height * 0.35)
+                        cr.width = int(round(cr.height * target_ratio))
+                        cx = cr.x + cr.width / 2
+                        cy = cr.y + cr.height / 2
+                        cr.x = max(0, min(int(round(cx - cr.width / 2)), source_width - cr.width))
+                        cr.y = max(0, min(int(round(cy - cr.height / 2)), source_height - cr.height))
+                        cx = cr.x + cr.width / 2
+                        cy = cr.y + cr.height / 2
+                    elif target_ratio >= 1.0 and cr.width < int(source_width * 0.35):
+                        cr.width = int(source_width * 0.35)
+                        cr.height = int(round(cr.width / target_ratio))
+                        cx = cr.x + cr.width / 2
+                        cy = cr.y + cr.height / 2
+                        cr.x = max(0, min(int(round(cx - cr.width / 2)), source_width - cr.width))
+                        cr.y = max(0, min(int(round(cy - cr.height / 2)), source_height - cr.height))
+                        cx = cr.x + cr.width / 2
+                        cy = cr.y + cr.height / 2
                     cx = cr.x + cr.width / 2
                     cy = cr.y + cr.height / 2
                     if smooth_cx is None:
                         smooth_cx = float(cx)
                         smooth_cy = float(cy)
                     else:
+                        assert smooth_cx is not None and smooth_cy is not None
                         smooth_cx = (1 - smoothing_alpha) * smooth_cx + smoothing_alpha * float(cx)
                         smooth_cy = (1 - smoothing_alpha) * smooth_cy + smoothing_alpha * float(cy)
 
@@ -438,7 +500,7 @@ def build_crop_trajectory(
                     continue
 
         # Fallback: center crop or hold last position
-        if smooth_cx is not None:
+        if smooth_cx is not None and trajectory:
             # Hold last crop position
             last = trajectory[-1]
             trajectory.append(CropTrajectoryPoint(
@@ -450,13 +512,19 @@ def build_crop_trajectory(
                 source_width=source_width, source_height=source_height,
             ))
         else:
-            # No speaker data: center crop
+            # No speaker data: use smoothed center (from initial_center) or center crop
             from .cropper import _center_crop
             cr = _center_crop(source_width, source_height, target_ratio)
-            cx = cr.x + cr.width / 2
-            cy = cr.y + cr.height / 2
-            smooth_cx = float(cx)
-            smooth_cy = float(cy)
+            if smooth_cx is not None and smooth_cy is not None:
+                # Reposition crop to the smoothed center (Gemini-recommended or held)
+                cx, cy = smooth_cx, smooth_cy
+            else:
+                cx = cr.x + cr.width / 2
+                cy = cr.y + cr.height / 2
+                smooth_cx = float(cx)
+                smooth_cy = float(cy)
+            cr.x = max(0, min(int(round(cx - cr.width / 2)), source_width - cr.width))
+            cr.y = max(0, min(int(round(cy - cr.height / 2)), source_height - cr.height))
             trajectory.append(CropTrajectoryPoint(
                 time=t,
                 center_x=smooth_cx / source_width,
