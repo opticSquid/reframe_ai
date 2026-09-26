@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-"""Test Gemini API key connectivity."""
+"""Test Gemini API key with the new google.genai SDK (not deprecated google.generativeai)."""
 import os
 import sys
 from pathlib import Path
@@ -17,30 +17,27 @@ if not api_key:
 
 print(f"Key present: {len(api_key)} chars, prefix: {api_key[:15]}...")
 
-try:
-    import google.generativeai as genai
-    print(f"google-generativeai version: {genai.__version__}")
-except ImportError:
-    print("FAIL: google-generativeai not installed")
-    sys.exit(1)
+from google import genai
 
-# Configure and test
-genai.configure(api_key=api_key)
+client = genai.Client(api_key=api_key)
+print("google.genai SDK imported successfully")
 
 # List available models
-print("\n--- Available Gemini models ---")
-for m in genai.list_models():
-    if "gemini" in m.name.lower():
-        print(f"  {m.name}: {', '.join(m.supported_generation_methods[:3])}")
+print("\n--- Available Gemini models (first 10) ---")
+for model in client.models.list():
+    if "gemini" in model.name.lower():
+        print(f"  {model.name}: {', '.join(model.supported_actions or [])}")
 
 # Test a simple prompt
 print("\n--- Testing API call ---")
 try:
-    model = genai.GenerativeModel("gemini-3.8-flash")
-    response = model.generate_content("Hello from ReframeAI. Please respond with exactly: GEMINI_OK")
+    response = client.models.generate_content(
+        model="gemini-3.8-flash",
+        contents="Hello from ReframeAI. Please respond with exactly: GEMINI_OK",
+    )
     print(f"Response: '{response.text.strip()}'")
     if response.text.strip() == "GEMINI_OK":
-        print("\n✅ Gemini API key WORKS — call succeeded")
+        print("\n✅ Gemini API key WORKS — call succeeded via google.genai SDK")
     else:
         print(f"\n⚠️ API responded but with: '{response.text.strip()}'")
 except Exception as e:
