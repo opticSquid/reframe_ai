@@ -1,6 +1,9 @@
 # Input assets
 data/
 
+# Downloaded MediaPipe models
+models/
+
 # Python
 __pycache__/
 *.py[cod]
