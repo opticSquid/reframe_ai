@@ -59,7 +59,18 @@ reframe_ai/
 - `GEMINI_API_KEY` required for AI features (crop planning, output critique) — copy `.env.example` to `.env`
 - ffmpeg/ffprobe on PATH (validator uses ffprobe for video/audio checks)
 - Node 20+ for frontend development
-- MediaPipe model files in `models/` (gitignored) — face detection, face landmarker, pose landmarker, person detector
+- MediaPipe model files are committed in `models/` (21MB total) — no download needed
+
+### MediaPipe models
+
+The following models are included in `models/` (Git LFS not required, files are small):
+
+| File | Size | Used by |
+|------|------|---------|
+| `blaze_face_full_range_sparse_float16.tflite` | 664K | Face detection |
+| `face_landmarker_float16.task` | 3.6M | Face landmarks, MAR (speaking detection) |
+| `efficientdet_lite0_float16.tflite` | 7.0M | Person/object detection |
+| `pose_landmarker_full_float16.task` | 9.0M | Pose estimation (crop planning) |
 
 ### `.env` file
 

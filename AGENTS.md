@@ -59,7 +59,7 @@ Frontend needs Node 20+ (see `frontend/package.json`).
 
 ## Pitfalls
 
-- `data/` and `models/` are gitignored — sample assets (`input_image.png`, `input_video.mp4`) and MediaPipe model files (`.tflite`, `.task`) exist locally only; reference via `config.DATA_DIR` / `config.MODELS_DIR` in code, not hard paths.
+`data/` is gitignored (sample assets like `input_image.png`, `input_video.mp4` are local-only). `models/` is committed (21MB total) — MediaPipe model files (`.tflite`, `.task`), so no download is needed. Reference both via `config.DATA_DIR` / `config.MODELS_DIR` in code, not hard paths.
 - MediaPipe detection requires model files in `models/` — `detect_subjects()` returns an empty list (not an error) when a model is missing, so `plan_crop` falls back to center crop.
 - Validator's file-dimension check (`verify_files=True`) uses PIL on the actual output file — tests create temp files with `PIL.Image.new(...)`.
 - Video audio check requires `ffprobe`; tests with `verify_files=False` skip disk checks.
