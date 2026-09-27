@@ -9,9 +9,7 @@ export default function Home() {
   async function checkBackend() {
     setLoading(true);
     try {
-      const backendUrl =
-        process.env.NEXT_PUBLIC_BACKEND_URL || "http://localhost:5000";
-      const res = await fetch(`${backendUrl}/health`);
+      const res = await fetch(`/health`);
       if (res.ok) {
         const data = await res.json();
         setBackendStatus(`Backend reachable: ${JSON.stringify(data)}`);

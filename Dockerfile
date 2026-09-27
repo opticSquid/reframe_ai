@@ -5,6 +5,8 @@ WORKDIR /app
 RUN apt-get update -qq && apt-get install -y --no-install-recommends \
     ffmpeg \
     libgl1 \
+    libegl1 \
+    libgles2 \
     libglib2.0-0 \
     libsm6 \
     && rm -rf /var/lib/apt/lists/*
@@ -15,7 +17,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     uv venv --python 3.14 .venv
 
 COPY pyproject.toml requirements.txt ./
-RUN source .venv/bin/activate && uv pip install --no-cache-dir -r requirements.txt
+RUN . .venv/bin/activate && uv pip install --no-cache-dir -r requirements.txt
 
 FROM base AS runtime
 COPY --from=deps /app/.venv .venv
