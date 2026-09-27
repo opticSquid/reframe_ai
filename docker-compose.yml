@@ -10,8 +10,6 @@ services:
       - ./data:/app/data
       - ./output:/app/output
       - ./spec:/app/spec
-    depends_on:
-      - frontend
 
   frontend:
     build:

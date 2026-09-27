@@ -2,7 +2,7 @@
 
 import { useState, useRef, useCallback } from "react";
 
-const BACKEND_URL = process.env.NEXT_PUBLIC_BACKEND_URL || "http://localhost:5000";
+const BACKEND_URL = process.env.NEXT_PUBLIC_BACKEND_URL || "";
 
 type ProgressEvent = { message: string; percent: number };
 type CompleteEvent = { complete: true; summary: any; type: "image" | "video" };
@@ -30,7 +30,7 @@ function toStaticUrl(absolutePath: string): string {
   }
   // Encode each path segment to handle special chars (?, #, spaces, etc.)
   const encodedPath = path.split("/").map(encodeURIComponent).join("/");
-  return `${BACKEND_URL}/output/${encodedPath}`;
+  return `/output/${encodedPath}`;
 }
 
 const UploadIcon = () => (
@@ -259,7 +259,7 @@ export default function Home() {
     formData.append("file", file);
 
     try {
-      const resp = await fetch(`${BACKEND_URL}/process`, {
+      const resp = await fetch(`/process`, {
         method: "POST",
         body: formData,
         headers: { "Accept": "text/event-stream" },
@@ -299,10 +299,9 @@ export default function Home() {
         }
       }
     } catch (err) {
-      const backendUrl = BACKEND_URL;
       setError(
         err instanceof Error && err.message === "Failed to fetch"
-          ? `Cannot reach backend server at ${backendUrl}. Is it running? Start with: uvicorn src.main:app --host 0.0.0.0 --port 5000`
+          ? "Cannot reach backend server. Is it running?"
           : err instanceof Error
           ? err.message
           : "Connection failed"
