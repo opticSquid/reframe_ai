@@ -1,0 +1,24 @@
+name: Release
+
+on:
+  release:
+    types: [published]
+
+jobs:
+  build-backend:
+    uses: ./.github/workflows/build-and-push-image.yml
+    with:
+      image_name: ${{ github.repository_owner }}/reframe_ai_backend
+      dockerfile: ./Dockerfile
+      image_tag: ${{ github.event.release.tag_name }}
+    secrets:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  build-frontend:
+    uses: ./.github/workflows/build-and-push-image.yml
+    with:
+      image_name: ${{ github.repository_owner }}/reframe_ai_frontend
+      dockerfile: ./Dockerfile.frontend
+      image_tag: ${{ github.event.release.tag_name }}
+    secrets:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
