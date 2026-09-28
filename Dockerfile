@@ -12,12 +12,11 @@ RUN apt-get update -qq && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 FROM base AS deps
-RUN --mount=type=cache,target=/root/.cache/uv \
-    pip install --no-cache-dir uv && \
-    uv venv --python 3.14 .venv
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /bin/uv
+RUN uv venv --python 3.14 .venv
 
-COPY pyproject.toml requirements.txt ./
-RUN . .venv/bin/activate && uv pip install --no-cache-dir -r requirements.txt
+COPY pyproject.toml uv.lock ./
+RUN . .venv/bin/activate && uv sync --frozen --no-cache
 
 FROM base AS runtime
 COPY --from=deps /app/.venv .venv

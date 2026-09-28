@@ -15,12 +15,15 @@ dependencies = [
     "numpy",
     "pillow",
     "pyyaml",
+    "python-dotenv>=1.0",
+    "mediapipe>=0.10",
+    "google-genai>=1.0",
 ]
 
 [project.optional-dependencies]
 dev = [
     "pytest",
-    "google-genai>=1.0",
+    "opencv-python-headless>=4.10",
 ]
 
 [tool.setuptools.packages.find]

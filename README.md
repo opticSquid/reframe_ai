@@ -10,9 +10,8 @@ cp .env.example .env
 # Edit .env and set GEMINI_API_KEY=your-key-here
 
 # 2. Backend
-uv venv --python 3.14 .venv
+uv sync --all-extras
 source .venv/bin/activate
-uv pip install -r requirements.txt
 uvicorn src.main:app --host 0.0.0.0 --port 5000
 
 # 3. Frontend (in a new terminal)
