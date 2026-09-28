@@ -2,59 +2,59 @@
 
 ```mermaid
 flowchart TD
-    USER[User uploads video MP4/MOV/AVI] --> S1
+    USER["User uploads video MP4/MOV/AVI"] --> S1
 
     %% Stage 1: Ingest
-    S1[STAGE 1: INGEST<br/>extract_video_metadata() in src/video_ingestion.py<br/>ffprobe → VideoMetadata<br/>(duration, fps, codec, audio tracks, total frames)] --> S2
+    S1["STAGE 1: INGEST<br/>extract_video_metadata() in src/video_ingestion.py<br/>ffprobe → VideoMetadata<br/>(duration, fps, codec, audio tracks, total frames)"] --> S2
 
     %% Stage 2: Perception
-    S2[STAGE 2: PERCEPTION<br/>VideoPerceiver in src/video_perception.py<br/>• Sample frames @ 4fps, max_dim=640<br/>• Face detection (BlazeFace, reused detector)<br/>• SimpleTracker (IOU + centroid)<br/>• Shot boundary detection<br/>→ list[TrackedPerson]<br/>[bboxes scaled back to source resolution]] --> S3
+    S2["STAGE 2: PERCEPTION<br/>VideoPerceiver in src/video_perception.py<br/>• Sample frames @ 4fps, max_dim=640<br/>• Face detection (BlazeFace, reused detector)<br/>• SimpleTracker (IOU + centroid)<br/>• Shot boundary detection<br/>→ list[TrackedPerson]<br/>[bboxes scaled back to source resolution]"] --> S3
 
     %% Stage 3: Audio
-    S3[STAGE 3: AUDIO<br/>detect_speech_activity() in src/video_audio.py<br/>ffmpeg audio extract → mono 16kHz PCM<br/>RMS energy @ 50ms windows → speech mask<br/>→ SpeechActivity] --> S4
+    S3["STAGE 3: AUDIO<br/>detect_speech_activity() in src/video_audio.py<br/>ffmpeg audio extract → mono 16kHz PCM<br/>RMS energy @ 50ms windows → speech mask<br/>→ SpeechActivity"] --> S4
 
     %% Stage 4: Landmarks (MAR)
-    S4[STAGE 4: LANDMARKS (MAR)<br/>VideoPerceiver.compute_mars() in src/video_perception.py<br/>• Sample frames @ 2fps<br/>• Face landmarker → MAR (Mouth Aspect Ratio)<br/>• Associate MAR to tracks by centroid proximity<br/>→ dict[track_id, list[(timestamp, mar)]]] --> S5
+    S4["STAGE 4: LANDMARKS (MAR)<br/>VideoPerceiver.compute_mars() in src/video_perception.py<br/>• Sample frames @ 2fps<br/>• Face landmarker → MAR (Mouth Aspect Ratio)<br/>• Associate MAR to tracks by centroid proximity<br/>→ dict[track_id, list[(timestamp, mar)]]"] --> S5
 
     %% Stage 5: Active Speaker
-    S5[STAGE 5: ACTIVE SPEAKER<br/>infer_active_speaker_timeline() in src/video_speaker.py<br/>Fuse: audio speech + visual MAR<br/>• Highest MAR face during speech = speaker<br/>• Temporal smoothing: hold 0.3s minimum<br/>• Merge adjacent same-speaker segments<br/>→ list[ActiveSpeakerSegment]] --> S6
+    S5["STAGE 5: ACTIVE SPEAKER<br/>infer_active_speaker_timeline() in src/video_speaker.py<br/>Fuse: audio speech + visual MAR<br/>• Highest MAR face during speech = speaker<br/>• Temporal smoothing: hold 0.3s minimum<br/>• Merge adjacent same-speaker segments<br/>→ list[ActiveSpeakerSegment]"] --> S6
 
     %% Stage 6: Best Segment Finding
-    S6[STAGE 6: BEST SEGMENT FINDING<br/>find_best_segment() in src/video_segment.py<br/>If video > VIDEO_SEGMENT_DURATION_SEC (30s):<br/>• Sliding window scored by weighted sum:<br/>  - Motion density (weight=0.30)<br/>  - Face activity (weight=0.25)<br/>  - Audio energy (weight=0.25)<br/>  - Shot changes (weight=0.20)<br/>If ≤30s: use entire video<br/>→ BestSegment (start, end, score)] --> S7
+    S6["STAGE 6: BEST SEGMENT FINDING<br/>find_best_segment() in src/video_segment.py<br/>If video > VIDEO_SEGMENT_DURATION_SEC (30s):<br/>• Sliding window scored by weighted sum:<br/>  - Motion density (weight=0.30)<br/>  - Face activity (weight=0.25)<br/>  - Audio energy (weight=0.25)<br/>  - Shot changes (weight=0.20)<br/>If ≤30s: use entire video<br/>→ BestSegment (start, end, score)"] --> S7
 
     %% Stage 7: Render + Review Feedback Loop
-    S7{RENDER + REVIEW LOOP<br/>src/video_pipeline.py<br/>up to VIDEO_SEGMENT_MAX_RETRIES=3 iterations}
+    S7{"RENDER + REVIEW LOOP<br/>src/video_pipeline.py<br/>up to VIDEO_SEGMENT_MAX_RETRIES=3 iterations"}
 
     %% 7a: Gemini Crop Planning
-    S7 --> GP[Gemini Pre-Render Crop Planning<br/>gemini_plan_crop() in src/video_review.py<br/>• Select keyframes (shot boundaries + speaker transitions)<br/>• Overlay face bboxes (red) + pose landmarks (green) + proposed crop (cyan)<br/>• ONE Gemini call → recommended center + coverage<br/>If unavailable: deterministic fallback (speaker face centroid)]
+    S7 --> GP["Gemini Pre-Render Crop Planning<br/>gemini_plan_crop() in src/video_review.py<br/>• Select keyframes (shot boundaries + speaker transitions)<br/>• Overlay face bboxes (red) + pose landmarks (green) + proposed crop (cyan)<br/>• ONE Gemini call → recommended center + coverage<br/>If unavailable: deterministic fallback (speaker face centroid)"]
     GP --> TRAJ
 
     %% 7b: Build Trajectory
-    TRAJ[Build Crop Trajectory<br/>build_crop_trajectory() in src/video_speaker.py<br/>• For each frame: find active speaker → predict interpolated bbox<br/>• Asymmetric padding: pad_x=0.5, pad_y_top=0.5, pad_y_bottom=0.5<br/>• compute_crop() with target_coverage=0.30 (default)<br/>• EMA smooth center (alpha=0.2)<br/>• Min crop height = 35% source (prevents excessive zoom)<br/>• Trajectory built for FULL video, then sliced to segment<br/>→ list[CropTrajectoryPoint]] --> SLICE
+    TRAJ["Build Crop Trajectory<br/>build_crop_trajectory() in src/video_speaker.py<br/>• For each frame: find active speaker → predict interpolated bbox<br/>• Asymmetric padding: pad_x=0.5, pad_y_top=0.5, pad_y_bottom=0.5<br/>• compute_crop() with target_coverage=0.30 (default)<br/>• EMA smooth center (alpha=0.2)<br/>• Min crop height = 35% source (prevents excessive zoom)<br/>• Trajectory built for FULL video, then sliced to segment<br/>→ list[CropTrajectoryPoint]"] --> SLICE
 
-    SLICE[Slice trajectory + tracks to segment<br/>start_frame:end_frame+1<br/>tracks filtered to segment bboxes] --> RENDER
+    SLICE["Slice trajectory + tracks to segment<br/>start_frame:end_frame+1<br/>tracks filtered to segment bboxes"] --> RENDER
 
     %% 7c: Render
-    RENDER[STAGE 7c: RENDER<br/>render_vertical_video() in src/video_rendering.py<br/>FFmpeg pipe: decode → Python crop → ffmpeg encode<br/>• Resize to 720×1280 (9:16)<br/>• libx264 CPU encode (superfast, CRF 28)<br/>• Audio mux (copy AAC)<br/>• Best-frame still extraction @ 4 ratios (1:1, 16:9, 9:16, 4:5)<br/>• Debug overlay (track bboxes + speaker label + crop rect)<br/>→ RenderResult (reel + stills + debug)] --> QUAL
+    RENDER["STAGE 7c: RENDER<br/>render_vertical_video() in src/video_rendering.py<br/>FFmpeg pipe: decode → Python crop → ffmpeg encode<br/>• Resize to 720×1280 (9:16)<br/>• libx264 CPU encode (superfast, CRF 28)<br/>• Audio mux (copy AAC)<br/>• Best-frame still extraction @ 4 ratios (1:1, 16:9, 9:16, 4:5)<br/>• Debug overlay (track bboxes + speaker label + crop rect)<br/>→ RenderResult (reel + stills + debug)"] --> QUAL
 
     %% 7d: Segment Quality
-    QUAL[Segment Quality Evaluation<br/>evaluate_segment_quality() in src/video_review.py<br/>Deterministic metrics:<br/>• Face coverage (speaker face in crop)<br/>• Audio coverage (speech fraction)<br/>• Shot retention<br/>• Speaker diversity<br/>• Trajectory validity<br/>→ SegmentQuality] --> REVIEW
+    QUAL["Segment Quality Evaluation<br/>evaluate_segment_quality() in src/video_review.py<br/>Deterministic metrics:<br/>• Face coverage (speaker face in crop)<br/>• Audio coverage (speech fraction)<br/>• Shot retention<br/>• Speaker diversity<br/>• Trajectory validity<br/>→ SegmentQuality"] --> REVIEW
 
     %% 7e: Gemini Review
-    REVIEW[STAGE 7e: AI VISUAL REVIEW<br/>gemini_review_video() in src/video_review.py<br/>• Select 8-12 representative frames (shot boundaries + speaker transitions)<br/>• Composite grid: original 16:9 + rendered 9:16 side by side<br/>• ONE Gemini call with full trajectory + speaker metadata<br/>→ VideoReviewResult (score, errors, suggestions)] --> CHECK
+    REVIEW["STAGE 7e: AI VISUAL REVIEW<br/>gemini_review_video() in src/video_review.py<br/>• Select 8-12 representative frames (shot boundaries + speaker transitions)<br/>• Composite grid: original 16:9 + rendered 9:16 side by side<br/>• ONE Gemini call with full trajectory + speaker metadata<br/>→ VideoReviewResult (score, errors, suggestions)"] --> CHECK
 
     %% Decision
-    CHECK{Both quality + review pass?}
-    CHECK -->|Yes| EXIT_LOOP[Exit loop with best result]
-    CHECK -->|No| ADJUST[Retry: shift segment boundaries (±3s)<br/>Widen target_coverage (loosen crop)<br/>Feed previous review errors to gemini_plan_crop]
+    CHECK{"Both quality + review pass?"}
+    CHECK -->|"Yes"| EXIT_LOOP["Exit loop with best result"]
+    CHECK -->|"No"| ADJUST["Retry: shift segment boundaries (±3s)<br/>Widen target_coverage (loosen crop)<br/>Feed previous review errors to gemini_plan_crop"]
     ADJUST --> GP
 
     %% Post-loop
-    EXIT_LOOP --> S8[STAGE 8: VALIDATION<br/>validate_asset() in src/validator.py<br/>• min 720×1280 for reel<br/>• audio_required = true (ffprobe check)<br/>• aspect ratio 9:16 (±2%)<br/>• Required metadata fields populated<br/>→ ValidationResult]
+    EXIT_LOOP --> S8["STAGE 8: VALIDATION<br/>validate_asset() in src/validator.py<br/>• min 720×1280 for reel<br/>• audio_required = true (ffprobe check)<br/>• aspect ratio 9:16 (±2%)<br/>• Required metadata fields populated<br/>→ ValidationResult"]
 
-    S8 --> SAVE[Save outputs:<br/>• output/video_reels/{stem}_9_16.mp4<br/>• output/video_reels/{stem}_debug.mp4<br/>• output/stills/{stem}_{1_1|16_9|9_16|4_5}.jpg<br/>• output/manifests/{stem}_*.json (8 debug artifacts)]
+    S8 --> SAVE["Save outputs:<br/>• output/video_reels/{stem}_9_16.mp4<br/>• output/video_reels/{stem}_debug.mp4<br/>• output/stills/{stem}_{1_1|16_9|9_16|4_5}.jpg<br/>• output/manifests/{stem}_*.json (8 debug artifacts)"]
 
-    SAVE --> OUT[OUTPUT<br/>• Vertical 9:16 reel with audio<br/>• Debug overlay video<br/>• 4 still images (1:1, 16:9, 9:16, 4:5)<br/>• 8+ JSON debug artifacts<br/>  (metadata, tracks, speaker timeline,<br/>  crop trajectory, validation, shots,<br/>  speech activity, AI review)]
+    SAVE --> OUT["OUTPUT<br/>• Vertical 9:16 reel with audio<br/>• Debug overlay video<br/>• 4 still images (1:1, 16:9, 9:16, 4:5)<br/>• 8+ JSON debug artifacts<br/>  (metadata, tracks, speaker timeline,<br/>  crop trajectory, validation, shots,<br/>  speech activity, AI review)"]
 ```
 
 ## Stages Summary
