@@ -219,6 +219,7 @@ def process_video_to_reel(
     for frame_idx, timestamp, raw in frames:
         arr = raw_to_numpy(raw, scaled_w, scaled_h)
         faces = perceiever.detect_faces(arr)
+        persons = perceiever.detect_persons(arr)
         for f in faces:
             f.frame_idx = frame_idx
             f.timestamp = timestamp
@@ -227,16 +228,23 @@ def process_video_to_reel(
             f.y = int(round(f.y * scale_y))
             f.width = int(round(f.width * scale_x))
             f.height = int(round(f.height * scale_y))
-        tracker.update(faces, metadata.width, metadata.height)
+        for p in persons:
+            p.frame_idx = frame_idx
+            p.timestamp = timestamp
+            p.x = int(round(p.x * scale_x))
+            p.y = int(round(p.y * scale_y))
+            p.width = int(round(p.width * scale_x))
+            p.height = int(round(p.height * scale_y))
+        tracker.update(faces, metadata.width, metadata.height, persons=persons)
         sample_results.append(FrameSample(
-            frame_idx=frame_idx, timestamp=timestamp, faces=faces,
+            frame_idx=frame_idx, timestamp=timestamp, faces=faces, persons=persons,
         ))
 
     perceiever.close()
     tracks = tracker.tracks
 
     # Filter out tracks with very few detections (likely noise)
-    tracks = [t for t in tracks if len(t.face_bboxes) >= 2]
+    tracks = [t for t in tracks if len(t.face_bboxes) + len(t.person_bboxes) >= 2]
 
     # ------------------------------------------------------------------
     # Stage 3: Audio analysis
@@ -402,6 +410,8 @@ def process_video_to_reel(
             target_coverage=cur_tc,
             smoothing_alpha=0.2,
             initial_center=ic,
+            shot_boundaries=shot_bounds,
+            scene_change_centers=best_crop_plan.scene_change_centers if best_crop_plan else None,
         )
 
         # Slice trajectory to segment (absolute times preserved)
@@ -597,14 +607,19 @@ def _slice_tracks_for_segment(
     end_frame = int(round(seg_end * fps))
     sliced: list[TrackedPerson] = []
     for track in tracks:
-        bboxes = [
+        face_bboxes = [
             f for f in track.face_bboxes
             if start_frame <= f.frame_idx <= end_frame
         ]
-        if len(bboxes) >= 2:
+        person_bboxes = [
+            p for p in track.person_bboxes
+            if start_frame <= p.frame_idx <= end_frame
+        ]
+        if len(face_bboxes) + len(person_bboxes) >= 2:
             sliced.append(TrackedPerson(
                 id=track.id,
-                face_bboxes=bboxes,
+                face_bboxes=face_bboxes,
+                person_bboxes=person_bboxes,
                 lost_count=track.lost_count,
                 last_mar=track.last_mar,
                 color=track.color,
@@ -658,7 +673,8 @@ def _build_video_manifest(
         "validation_passed": None,
         "validation_warnings": [],
         "speaker_segments": [s.to_dict() for s in segments],
-        "tracks": [{"id": t.id, "num_detections": len(t.face_bboxes)} for t in tracks],
+        "tracks": [{"id": t.id, "num_face_detections": len(t.face_bboxes),
+                     "num_person_detections": len(t.person_bboxes)} for t in tracks],
     }
 
 
@@ -690,11 +706,19 @@ def _save_artifacts(
         tracks_data.append({
             "id": track.id,
             "num_detections": len(track.face_bboxes),
-            "bboxes": [
+            "num_face_detections": len(track.face_bboxes),
+            "num_person_detections": len(track.person_bboxes),
+            "face_bboxes": [
                 {"frame": f.frame_idx, "time": f.timestamp,
                  "x": f.x, "y": f.y, "w": f.width, "h": f.height,
                  "confidence": f.confidence}
                 for f in track.face_bboxes
+            ],
+            "person_bboxes": [
+                {"frame": p.frame_idx, "time": p.timestamp,
+                 "x": p.x, "y": p.y, "w": p.width, "h": p.height,
+                 "confidence": p.confidence}
+                for p in track.person_bboxes
             ],
         })
     (manifests_dir / f"{stem}_person_tracks.json").write_text(

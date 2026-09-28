@@ -82,12 +82,27 @@ class ImagePipelineResult:
 
     def to_summary(self) -> dict[str, Any]:
         """Serializable summary for CLI output and API responses."""
+        # Aggregate validation errors/warnings across all variants so the
+        # frontend can display a top-level pass/fail status and error list.
+        all_errors: list[str] = []
+        all_warnings: list[str] = []
+        total_processing_time = 0.0
+        for v in self.variants.values():
+            all_errors.extend(v.validation.errors)
+            all_warnings.extend(v.validation.warnings)
+            total_processing_time += v.processing_time_sec
         return {
             "image_path": self.image_path,
             "image_dimensions": {"width": self.image_width, "height": self.image_height},
             "subjects_detected": self.subjects_detected,
             "ai_active": self.ai_detected,
             "all_passed": self.all_passed,
+            "validation_passed": self.all_passed,
+            "validation_errors": all_errors,
+            "validation_warnings": all_warnings,
+            "timing": {
+                "total": round(total_processing_time, 3),
+            },
             "variants": {
                 name: {
                     "ratio_name": v.ratio_name,

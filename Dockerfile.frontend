@@ -8,7 +8,7 @@ RUN npm ci || npm install
 FROM base AS builder
 COPY frontend/ ./
 COPY --from=deps /app/node_modules ./node_modules
-ARG NEXT_PUBLIC_BACKEND_URL=http://backend:5000
+ARG NEXT_PUBLIC_BACKEND_URL=http://localhost:5000
 ENV NEXT_PUBLIC_BACKEND_URL=${NEXT_PUBLIC_BACKEND_URL}
 RUN npm run build
 

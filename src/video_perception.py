@@ -23,9 +23,11 @@ from mediapipe.tasks.python import vision as mp_vision
 
 from .config import (
     FACE_DETECTION_MODEL,
+    PERSON_DETECTION_MODEL,
     MODELS_DIR,
     MIN_FACE_CONFIDENCE,
     MIN_POSE_CONFIDENCE,
+    MIN_OBJECT_CONFIDENCE,
     POSE_LANDMARKER_MODEL,
 )
 from .video_ingestion import VideoMetadata
@@ -50,6 +52,19 @@ def _track_color(track_id: int) -> tuple[int, int, int]:
 @dataclass
 class DetectedFace:
     """A face detection on a single frame."""
+
+    frame_idx: int
+    timestamp: float
+    x: int
+    y: int
+    width: int
+    height: int
+    confidence: float
+
+
+@dataclass
+class DetectedPerson:
+    """A person detection on a single frame (full-body bbox)."""
 
     frame_idx: int
     timestamp: float
@@ -86,6 +101,10 @@ class TrackedPerson:
 
     id: int
     face_bboxes: list[DetectedFace] = field(default_factory=list)
+    person_bboxes: list[DetectedPerson] = field(default_factory=list)
+    """Full-body person bboxes (larger, more stable than face bboxes).
+    Used for trajectory / crop centering. Falls back to face bboxes when no
+    person detector is available."""
     lost_count: int = 0
     last_mar: float | None = None
     color: tuple[int, int, int] = (0, 255, 0)
@@ -98,6 +117,7 @@ class FrameSample:
     frame_idx: int
     timestamp: float
     faces: list[DetectedFace]
+    persons: list[DetectedPerson] = field(default_factory=list)
 
 
 @dataclass
@@ -199,18 +219,21 @@ def compute_mar(landmarks: list[Any]) -> float:
 # ---------------------------------------------------------------------------
 # Simple IOU + centroid tracker
 # ---------------------------------------------------------------------------
-def _bbox_center(f: DetectedFace) -> tuple[float, float]:
+_BBoxLike = DetectedFace | DetectedPerson
+
+
+def _bbox_center(f: _BBoxLike) -> tuple[float, float]:
     return (f.x + f.width / 2, f.y + f.height / 2)
 
 
-def _centroid_dist(a: DetectedFace, b: DetectedFace, max_dim: float) -> float:
-    """Normalized centroid distance (0–1) between two face bboxes."""
+def _centroid_dist(a: _BBoxLike, b: _BBoxLike, max_dim: float) -> float:
+    """Normalized centroid distance (0–1) between two bboxes."""
     ax, ay = _bbox_center(a)
     bx, by = _bbox_center(b)
     return float(np.sqrt((ax - bx) ** 2 + (ay - by) ** 2) / max_dim)
 
 
-def _iou(a: DetectedFace, b: DetectedFace) -> float:
+def _iou(a: _BBoxLike, b: _BBoxLike) -> float:
     ax1, ay1, aw, ah = a.x, a.y, a.width, a.height
     bx1, by1, bw, bh = b.x, b.y, b.width, b.height
     ix1 = max(ax1, bx1)
@@ -226,16 +249,30 @@ def _iou(a: DetectedFace, b: DetectedFace) -> float:
     return inter / union
 
 
+def _bbox_contains(inner: DetectedFace, outer: DetectedPerson) -> bool:
+    """Check if face bbox *inner* is contained within person bbox *outer*."""
+    return (
+        inner.x >= outer.x
+        and inner.y >= outer.y
+        and inner.x + inner.width <= outer.x + outer.width
+        and inner.y + inner.height <= outer.y + outer.height
+    )
+
+
 class SimpleTracker:
     """Lightweight IOU + centroid tracker with ID persistence.
 
-    Uses a combined cost metric: IOU for overlapping faces, centroid
-    distance for faces that have moved.  No heavy dependencies.
+    Primary tracking uses **person bboxes** (EfficientDet) when available —
+    these are ~5-10x larger than face bboxes, making them far more stable
+    for IOU matching.  Face bboxes are associated to tracks by containment
+    for MAR/speaker inference.
+
+    Falls back to face-only tracking when person detection is unavailable.
     """
 
     def __init__(
         self,
-        max_lost: int = 15,
+        max_lost: int = 30,
         iou_threshold: float = 0.15,
         dist_threshold: float = 0.5,
     ):
@@ -254,36 +291,53 @@ class SimpleTracker:
         faces: list[DetectedFace],
         img_width: int,
         img_height: int,
+        persons: list[DetectedPerson] | None = None,
     ) -> list[int]:
-        """Update tracker with faces from a new frame.
+        """Update tracker with detections from a new frame.
 
-        Returns list of track IDs corresponding to input faces.
+        When ``persons`` is provided, they are used as the primary tracking
+        signal (larger, more stable bboxes).  Each face is then associated to
+        the track whose person bbox contains it.  Returns track IDs
+        corresponding to the **person** detections (or faces when no
+        persons were detected).
         """
         img_diag = max(img_width, img_height) * 1.414
+        primary = persons if persons is not None else faces
 
         if not self._tracks:
             assignments: list[int] = []
-            for f in faces:
+            for p in primary:
                 track = TrackedPerson(id=self._next_id)
-                track.face_bboxes.append(f)
+                if persons is not None:
+                    track.person_bboxes.append(p)  # type: ignore[arg-type]
+                else:
+                    track.face_bboxes.append(p)  # type: ignore[arg-type]
                 track.color = _track_color(self._next_id)
                 self._tracks.append(track)
                 assignments.append(self._next_id)
                 self._next_id += 1
+            # Associate faces to the newly created tracks
+            self._associate_faces(primary, faces)
             return assignments
 
-        assignments = [-1] * len(faces)
+        assignments = [-1] * len(primary)
         used_tracks: set[int] = set()
 
-        for fi, face in enumerate(faces):
+        for fi, det in enumerate(primary):
             best_track_idx = -1
             best_score = 0.0
             for ti, track in enumerate(self._tracks):
-                if ti in used_tracks or not track.face_bboxes:
+                if ti in used_tracks:
                     continue
-                last_face = track.face_bboxes[-1]
-                i = _iou(face, last_face)
-                d = _centroid_dist(face, last_face, img_diag)
+                last_primary = (
+                    track.person_bboxes[-1] if track.person_bboxes
+                    else track.face_bboxes[-1] if track.face_bboxes
+                    else None
+                )
+                if last_primary is None:
+                    continue
+                i = _iou(det, last_primary)
+                d = _centroid_dist(det, last_primary, img_diag)
                 score = i if i >= self._iou_threshold else 0.0
                 if score == 0.0 and d < self._dist_threshold:
                     score = (1.0 - d) * 0.5
@@ -293,23 +347,71 @@ class SimpleTracker:
 
             if best_track_idx >= 0:
                 used_tracks.add(best_track_idx)
-                self._tracks[best_track_idx].face_bboxes.append(face)
+                if persons is not None:
+                    track = self._tracks[best_track_idx]
+                    track.person_bboxes.append(det)  # type: ignore[arg-type]
+                else:
+                    self._tracks[best_track_idx].face_bboxes.append(det)  # type: ignore[arg-type]
                 self._tracks[best_track_idx].lost_count = 0
                 assignments[fi] = self._tracks[best_track_idx].id
             else:
                 track = TrackedPerson(id=self._next_id)
-                track.face_bboxes.append(face)
+                if persons is not None:
+                    track.person_bboxes.append(det)  # type: ignore[arg-type]
+                else:
+                    track.face_bboxes.append(det)  # type: ignore[arg-type]
                 track.color = _track_color(self._next_id)
                 self._tracks.append(track)
                 assignments[fi] = self._next_id
                 self._next_id += 1
 
+        # When tracking persons, associate face bboxes to tracks by containment
+        if persons is not None:
+            self._associate_faces(persons, faces)
+
+        # Increment lost_count for tracks that weren't updated
         for ti, track in enumerate(self._tracks):
             if ti not in used_tracks:
                 track.lost_count += 1
 
         self._tracks = [t for t in self._tracks if t.lost_count <= self._max_lost]
         return assignments
+
+    def _associate_faces(self, primary: list, faces: list[DetectedFace]) -> None:
+        """Associate face bboxes to tracks by containment in person bbox.
+
+        When a face falls inside a track's most recent person bbox, append
+        it to that track's ``face_bboxes`` for MAR computation.
+        """
+        for face in faces:
+            assigned = False
+            for track in self._tracks:
+                if track.person_bboxes:
+                    person = track.person_bboxes[-1]
+                    if _bbox_contains(face, person):
+                        track.face_bboxes.append(face)
+                        assigned = True
+                        break
+            if not assigned:
+                # Fallback: append to nearest track by centroid distance
+                best_track = None
+                best_dist = float("inf")
+                fcx, fcy = _bbox_center(face)
+                for track in self._tracks:
+                    if track.face_bboxes:
+                        lx, ly = _bbox_center(track.face_bboxes[-1])
+                    elif track.person_bboxes:
+                        lx, ly = _bbox_center(track.person_bboxes[-1])
+                    else:
+                        continue
+                    dist = abs(fcx - lx) + abs(fcy - ly)
+                    if dist < best_dist:
+                        best_dist = dist
+                        best_track = track
+                if best_track is not None:
+                    best_track.face_bboxes.append(face)
+                    assigned = True
+            # If still unassigned, face is orphaned (tracked via persons)
 
 
 # ---------------------------------------------------------------------------
@@ -330,6 +432,7 @@ class VideoPerceiver:
         self._face_detector: Any = None
         self._face_landmarker: Any = None
         self._pose_landmarker: Any = None
+        self._person_detector: Any = None
         self._num_faces = num_faces
 
     def _get_face_detector(self) -> Any:
@@ -511,6 +614,63 @@ class VideoPerceiver:
                 ))
         return poses
 
+    def _get_person_detector(self) -> Any:
+        """Create or return the cached EfficientDet person detector."""
+        if self._person_detector is not None:
+            return self._person_detector
+        model_path = str(PERSON_DETECTION_MODEL)
+        if not Path(model_path).exists():
+            return None
+        opts = mp_vision.ObjectDetectorOptions(
+            base_options=mp_tasks.BaseOptions(model_asset_path=model_path),
+            score_threshold=MIN_OBJECT_CONFIDENCE,
+            max_results=10,
+        )
+        self._person_detector = mp_vision.ObjectDetector.create_from_options(opts)
+        return self._person_detector
+
+    def detect_persons(self, rgb_array: np.ndarray) -> list[DetectedPerson]:
+        """Run person detection (EfficientDet) on a frame.
+
+        Returns full-body bounding boxes — larger and more stable than face-only
+        bboxes for tracking and crop centering.
+        """
+        detector = self._get_person_detector()
+        if detector is None:
+            return []
+
+        h, w = rgb_array.shape[:2]
+        mp_img = mp.Image(image_format=mp.ImageFormat.SRGB, data=np.ascontiguousarray(rgb_array))
+        try:
+            results = detector.detect(mp_img)
+        except Exception:
+            return []
+
+        persons: list[DetectedPerson] = []
+        if results.detections:
+            for det in results.detections:
+                category = det.categories[0] if det.categories else None
+                if category is None:
+                    continue
+                name = getattr(category, "category_name", "") or ""
+                if name.lower() not in ("person", "person ", "people"):
+                    continue
+                bbox = det.bounding_box
+                persons.append(DetectedPerson(
+                    frame_idx=0, timestamp=0.0,
+                    x=int(bbox.origin_x), y=int(bbox.origin_y),
+                    width=int(bbox.width), height=int(bbox.height),
+                    confidence=float(category.score),
+                ))
+        return persons
+
+    def detect_all(self, rgb_array: np.ndarray) -> tuple[list[DetectedFace], list[DetectedPerson], list[DetectedPose]]:
+        """Run all three detectors in one call — avoids redundant MediaPipe setup."""
+        faces = self.detect_faces(rgb_array)
+        persons = self.detect_persons(rgb_array)
+        poses = self.detect_poses(rgb_array)
+        return faces, persons, poses
+
     def close(self) -> None:
         """Release MediaPipe resources."""
         if self._face_detector is not None:
@@ -519,6 +679,9 @@ class VideoPerceiver:
         if self._face_landmarker is not None:
             self._face_landmarker.close()
             self._face_landmarker = None
+        if self._person_detector is not None:
+            self._person_detector.close()
+            self._person_detector = None
         if self._pose_landmarker is not None:
             self._pose_landmarker.close()
             self._pose_landmarker = None

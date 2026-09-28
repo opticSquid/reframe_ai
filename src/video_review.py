@@ -30,7 +30,7 @@ from PIL import Image, ImageDraw, ImageFont
 from .config import gemini_available
 from .video_speaker import CropTrajectoryPoint, ActiveSpeakerSegment
 from .video_ingestion import VideoMetadata
-from .video_perception import VideoPerceiver, DetectedFace, DetectedPose, TrackedPerson
+from .video_perception import VideoPerceiver, DetectedFace, DetectedPose, DetectedPerson, TrackedPerson
 
 
 @dataclass
@@ -394,7 +394,8 @@ def gemini_review_video(
     # --- Single Gemini call ---
     prompt = f"""You are an expert video editor reviewing a vertical (9:16) reel
 auto-generated from a horizontal (16:9) master video. The reel uses dynamic
-cropping to follow the active speaker.
+cropping to follow the active speaker. Person bboxes (yellow), face bboxes
+(red), and pose landmarks (green dots) may appear in the keyframe grid.
 
 Below is a composite grid image with {len(timestamps)} representative frames:
   - LEFT column = original 16:9 frame with the applied crop rectangle overlaid (cyan box)
@@ -497,6 +498,13 @@ class GeminiCropPlanResult:
     warnings: list[str] = field(default_factory=list)
     suggestions: list[str] = field(default_factory=list)
     raw_response: str = ""
+    scene_change_centers: dict[float, tuple[float, float]] = field(default_factory=dict)
+    """Map of shot-boundary timestamps → recommended crop center (normalized).
+
+    When populated, the pipeline adjusts the crop center at each shot boundary
+    to follow the user's semantic recommendation rather than holding the
+    previous position.
+    """
 
 
 @dataclass
@@ -601,12 +609,22 @@ def _draw_keyframe_with_overlays(
     frame: np.ndarray,
     faces: list[DetectedFace],
     poses: list[DetectedPose],
+    persons: list[DetectedPerson],
     proposed_crop: tuple[int, int, int, int] | None,  # (x, y, w, h) in source pixels
 ) -> np.ndarray:
-    """Draw face bboxes (red), pose landmarks (green), and proposed crop (cyan) on a frame."""
+    """Draw face bboxes (red), pose landmarks (green), person bboxes (yellow), and proposed crop (cyan)."""
     from .video_perception import _track_color
     img = Image.fromarray(frame).convert("RGB")
     draw = ImageDraw.Draw(img)
+    orig_w, orig_h = img.size
+
+    # Draw person bboxes (yellow — these are the larger, more stable full-body bboxes)
+    for i, person in enumerate(persons):
+        color = (255, 255, 50)  # yellow
+        draw.rectangle(
+            [person.x, person.y, person.x + person.width, person.y + person.height],
+            outline=color, width=2,
+        )
 
     # Draw pose landmarks
     if poses:
@@ -614,26 +632,21 @@ def _draw_keyframe_with_overlays(
             if not pose.landmarks or not pose.bbox:
                 continue
             bx, by, bw, bh = pose.bbox
-            # Get original dimensions for scaling
-            orig_w, orig_h = img.size
-            scale_x = orig_w / 640
-            scale_y = orig_h / 640
             for lm_idx in range(len(pose.landmarks)):
                 lx, ly = pose.landmarks[lm_idx]
-                px = int(lx * 640 * scale_x)
-                py = int(ly * 640 * scale_y)
+                px = int(lx * 640 * orig_w / 640)
+                py = int(ly * 640 * orig_h / 640)
                 draw.ellipse([px - 2, py - 2, px + 2, py + 2], fill=(50, 255, 50))
-            # Draw skeleton
             for a, b in _POSE_SKELETON:
                 if a < len(pose.landmarks) and b < len(pose.landmarks):
                     ax, ay = pose.landmarks[a]
                     bx2, by2 = pose.landmarks[b]
                     draw.line([
-                        (int(ax * 640 * scale_x), int(ay * 640 * scale_y)),
-                        (int(bx2 * 640 * scale_x), int(by2 * 640 * scale_y)),
+                        (int(ax * orig_w), int(ay * orig_h)),
+                        (int(bx2 * orig_w), int(by2 * orig_h)),
                     ], fill=(50, 200, 50), width=1)
 
-    # Draw face bboxes
+    # Draw face bboxes (red)
     for i, face in enumerate(faces):
         color = (255, 50, 50)
         draw.rectangle(
@@ -642,7 +655,7 @@ def _draw_keyframe_with_overlays(
         )
         draw.text((face.x, face.y - 15), f"Face {i+1}", fill=color)
 
-    # Draw proposed crop rectangle
+    # Draw proposed crop rectangle (cyan)
     if proposed_crop:
         cx, cy, cw, ch = proposed_crop
         draw.rectangle(
@@ -688,6 +701,22 @@ def _build_keyframe_grid(
     return buf.getvalue()
 
 
+def _parse_scene_adjustments(raw: Any) -> dict[float, tuple[float, float]]:
+    """Parse scene_adjustments from Gemini JSON into {timestamp: (cx, cy)}."""
+    result: dict[float, tuple[float, float]] = {}
+    if not raw or not isinstance(raw, dict):
+        return result
+    for ts_str, adj in raw.items():
+        try:
+            ts = float(ts_str)
+            cx = float(adj.get("center_x", 0.5))
+            cy = float(adj.get("center_y", 0.5))
+            result[ts] = (cx, cy)
+        except (ValueError, TypeError, AttributeError):
+            continue
+    return result
+
+
 def gemini_plan_crop(
     video_path: str | Path,
     metadata: VideoMetadata,
@@ -701,9 +730,10 @@ def gemini_plan_crop(
     """Ask Gemini to recommend the optimal crop center for a 30-second segment.
 
     Samples representative keyframes from the segment, runs face detection +
-    pose estimation on each, builds a composite grid showing the keyframes
-    with face bboxes (red), pose landmarks (green), and a *proposed* initial
-    crop window (cyan), then sends a SINGLE Gemini call.
+    person detection (EfficientDet) + pose estimation on each, builds a composite
+    grid showing the keyframes with person bboxes (yellow), face bboxes (red),
+    pose landmarks (green), and a *proposed* initial crop window (cyan), then
+    sends a SINGLE Gemini call.
 
     Gemini returns the recommended crop center (normalized 0–1) and any
     observations about content that might be missed.
@@ -746,24 +776,25 @@ def gemini_plan_crop(
 
     perceiever = VideoPerceiver(min_face_confidence=0.3, num_faces=10)
 
-    frames_data: list[tuple[np.ndarray, list[DetectedFace], list[DetectedPose], float, str]] = []
+    frames_data: list[tuple[np.ndarray, list[DetectedFace], list[DetectedPose], list[DetectedPerson], float, str]] = []
 
     for t, reason in plan_points:
         # Extract frame at native resolution
         frame = _extract_frame_at_time(video_path, t, metadata.width, metadata.height)
         if frame is None:
             continue
-        # Run perception at reduced resolution for speed
-        from .video_perception import raw_to_numpy, extract_frames_by_interval, get_scaled_dims
-        # Re-run face detection at native resolution (simpler, accurate)
+        # Run perception at native resolution
         faces = perceiever.detect_faces(frame)
         for f in faces:
-            # Already in native resolution since we pass the native frame
             f.frame_idx = int(t * metadata.fps)
             f.timestamp = t
 
-        # Pose detection at native resolution
         poses = perceiever.detect_poses(frame)
+        persons = perceiever.detect_persons(frame)
+        # Scale person bboxes (they come from model at native res, but be safe)
+        for p in persons:
+            p.frame_idx = int(t * metadata.fps)
+            p.timestamp = t
 
         # Draw a proposed initial crop (center of all faces, full-height crop)
         proposed_crop = None
@@ -787,8 +818,8 @@ def gemini_plan_crop(
             proposed_crop = (crop_x, crop_y, crop_w, crop_h)
 
         # Draw overlays on the frame
-        overlayed = _draw_keyframe_with_overlays(frame, faces, poses, proposed_crop)
-        frames_data.append((overlayed, faces, poses, t, reason))
+        overlayed = _draw_keyframe_with_overlays(frame, faces, poses, persons, proposed_crop)
+        frames_data.append((overlayed, faces, poses, persons, t, reason))
 
     perceiever.close()
 
@@ -803,30 +834,42 @@ def gemini_plan_crop(
     # Build composite
     composite = _build_keyframe_grid(
         [d[0] for d in frames_data],
-        [d[3] for d in frames_data],
         [d[4] for d in frames_data],
+        [d[5] for d in frames_data],
     )
 
     # Build metadata text
     face_info = []
     pose_info = []
-    for i, (frame, faces, poses, t, reason) in enumerate(frames_data):
-        face_strs = [f"face{ j+1 }(x={f.x},y={f.y},w={f.width},h={f.height})" for j, f in enumerate(faces)]
+    person_info = []
+    for i, (frame, faces, poses, persons, t, reason) in enumerate(frames_data):
+        face_strs = [f"face{j+1}(x={f.x},y={f.y},w={f.width},h={f.height})" for j, f in enumerate(faces)]
         pose_strs = [f"pose{i+1}(nose=({p.nose[0]:.2f},{p.nose[1]:.2f}), shoulders=L({p.left_shoulder[0]:.2f},{p.left_shoulder[1]:.2f}) R({p.right_shoulder[0]:.2f},{p.right_shoulder[1]:.2f}))" for i, p in enumerate(poses) if p.nose and p.left_shoulder and p.right_shoulder]
+        person_strs = [f"person{j+1}(x={p.x},y={p.y},w={p.width},h={p.height},conf={p.confidence:.2f})" for j, p in enumerate(persons)]
         face_info.append(f"  t={t:.1f}s ({reason[:30]}): {', '.join(face_strs) if face_strs else 'no faces'}")
         pose_info.append(f"  t={t:.1f}s: {', '.join(pose_strs) if pose_strs else 'no poses'}")
+        person_info.append(f"  t={t:.1f}s: {', '.join(person_strs) if person_strs else 'no persons'}")
+
+    shot_timestamps = [f"{fb / metadata.fps:.1f}s" for fb in shot_boundaries]
+    scene_context = f"SHOT BOUNDARIES in segment: {', '.join(shot_timestamps) if shot_timestamps else 'none'}"
 
     metadata_text = (
         f"SOURCE: {metadata.width}x{metadata.height}, {metadata.fps:.1f}fps, "
         f"{metadata.duration_sec:.1f}s\n"
         f"SEGMENT: {segment_start:.1f}s - {segment_end:.1f}s ({segment_end - segment_start:.1f}s)\n"
         f"TARGET: 9:16 vertical (720x1280)\n"
-        f"SPEAKER SEGMENTS IN RANGE:\n" +
-        "\n".join(f"  {s.start:.1f}s-{s.end:.1f}s: P{s.speaker_id} (conf={s.confidence:.2f})"
-                  for s in segments if segment_start <= s.start <= segment_end) +
-        "\n\nFACE DETECTIONS:\n" + "\n".join(face_info) +
-        "\n\nPOSE KEYPOINTS:\n" + "\n".join(pose_info) +
-        f"PROPOSED CROP (cyan box on frames): centered on faces, 80% source height"
+        f"SPEAKER SEGMENTS IN RANGE:\n"
+        + "\n".join(f"  {s.start:.1f}s-{s.end:.1f}s: P{s.speaker_id} (conf={s.confidence:.2f})"
+                  for s in segments if segment_start <= s.start <= segment_end)
+        + f"\n\n{scene_context}\n\n"
+        "KEYFRAME LEGEND:\n"
+        "  Yellow = person bbox (full-body, used for tracking/crop)\n"
+        "  Red = face bbox (for MAR/speaker inference)\n"
+        "  Green = pose keypoints\n"
+        "  Cyan = proposed initial crop\n"
+        + "\n\nFACE DETECTIONS:\n" + "\n".join(face_info)
+        + "\n\nPERSON DETECTIONS:\n" + "\n".join(person_info)
+        + "\n\nPOSE KEYPOINTS:\n" + "\n".join(pose_info)
     )
 
     # If this is a retry, include previous review feedback
@@ -840,9 +883,9 @@ def gemini_plan_crop(
         )
 
     prompt = f"""You are an expert video editor composing a vertical (9:16) reel from a
-horizontal (16:9) master video segment. Face bounding boxes (red) and pose
-landmarks (green dots) are overlaid on each keyframe. The cyan rectangle shows
-a PROPOSED initial crop window.
+horizontal (16:9) master video segment. Person bboxes (yellow), face bboxes
+(red), and pose landmarks (green dots) are overlaid on each keyframe. The cyan
+rectangle shows a PROPOSED initial crop window.
 
 REVIEW METADATA:
 {metadata_text}
@@ -851,18 +894,24 @@ REVIEW METADATA:
 For EACH keyframe, assess:
 1. Is the proposed crop center optimal, or should it shift (dx, dy)?
 2. Are important people/objects being cropped out that should be visible?
-3. Is the crop too tight (faces filling too much) or too loose (too much empty space)?
+3. Is the crop too tight (people filling too much) or too loose (too much empty space)?
 4. At speaker transitions, does the crop need to jump to a different person?
+5. At shot boundaries (scene changes), should the crop center shift to keep
+   the most important person framed, rather than holding the previous position?
+6. Use the PERSON bboxes (yellow) for framing — they are more stable than
+   face-only bboxes. Frame the upper torso / shoulders area, not face alone.
 
 Respond with ONLY a JSON object:
 {{
-  "center_x": float,   // recommended normalized crop center X (0.0–1.0, relative to source width)
-  "center_y": float,   // recommended normalized crop center Y (0.0–1.0, relative to source height)
-  "coverage": float,   // recommended target_coverage for compute_crop (0.2–0.45; lower = looser crop)
+  "center_x": float,   // recommended normalized crop center X (0.0–1.0)
+  "center_y": float,   // recommended normalized crop center Y (0.0–1.0)
+  "coverage": float,   // target_coverage for compute_crop (0.2–0.45; lower = looser)
   "errors": ["critical issues"],
   "warnings": ["minor issues"],
-  "suggestions": ["improvement suggestions"]
-}}"""
+  "suggestions": ["improvement suggestions"],
+  "scene_adjustments": {{
+    // At each scene change (shot boundary), where should the crop center move?
+  }}"""
 
     contents: list[Any] = [types.Content(
         role="user",
@@ -920,6 +969,7 @@ Respond with ONLY a JSON object:
                     warnings=list(data.get("warnings", [])),
                     suggestions=list(data.get("suggestions", [])),
                     raw_response=text,
+                    scene_change_centers=_parse_scene_adjustments(data.get("scene_adjustments")),
                 )
             except (json.JSONDecodeError, ValueError):
                 pass
@@ -944,8 +994,8 @@ def evaluate_segment_quality(
     """Evaluate a video segment using deterministic metrics.
 
     Checks:
-      - Face coverage: fraction of trajectory points where an active speaker
-        face is visible within the crop
+      - Subject coverage: fraction of trajectory points where an active speaker
+        subject (person bbox if available, else face) is visible within the crop
       - Audio coverage: fraction of the segment with speech activity
       - Shot retention: fraction of shot boundaries that fall within the segment
       - Speaker diversity: number of unique speakers in the segment
@@ -967,42 +1017,46 @@ def evaluate_segment_quality(
     errors: list[str] = []
     warnings: list[str] = []
 
-    # --- Face coverage: fraction of trajectory points with active speaker face
-    # in the crop region ---
-    face_in_crop = 0
+    # --- Subject coverage: fraction of trajectory points with active speaker
+    # detected subject (person or face) visible within the crop region.
+    # Uses person bboxes when available (larger, more stable), falls back to face.
+    subject_in_crop = 0
     total_traj = len(trajectory)
     if total_traj > 0:
-        # Build track bbox lookup
-        track_times: dict[int, list[tuple[float, DetectedFace]]] = {}
+        # Build track bbox lookups for both person and face bboxes
+        track_person_times: dict[int, list[tuple[float, DetectedPerson]]] = {}
+        track_face_times: dict[int, list[tuple[float, DetectedFace]]] = {}
         for track in tracks:
+            for p in track.person_bboxes:
+                track_person_times.setdefault(track.id, []).append((p.timestamp, p))
             for f in track.face_bboxes:
-                track_times.setdefault(track.id, []).append((f.timestamp, f))
+                track_face_times.setdefault(track.id, []).append((f.timestamp, f))
 
         for point in trajectory:
             if point.speaker_id < 0:
                 continue
-            # Find nearest bbox for this speaker
-            samples = track_times.get(point.speaker_id, [])
+            # Prefer person bbox; fall back to face bbox
+            samples = track_person_times.get(point.speaker_id, [])
+            if not samples:
+                samples = track_face_times.get(point.speaker_id, [])
             if not samples:
                 continue
             nearest = min(samples, key=lambda s: abs(s[0] - point.time))
             bbox = nearest[1]
-            # Check if face bbox overlaps with crop
             crop_x, crop_y, crop_w, crop_h = point.crop_x, point.crop_y, point.crop_w, point.crop_h
-            face_cx = bbox.x + bbox.width / 2
-            face_cy = bbox.y + bbox.height / 2
-            if crop_x <= face_cx <= crop_x + crop_w and crop_y <= face_cy <= crop_y + crop_h:
-                face_in_crop += 1
+            bbox_cx = bbox.x + bbox.width / 2
+            bbox_cy = bbox.y + bbox.height / 2
+            if crop_x <= bbox_cx <= crop_x + crop_w and crop_y <= bbox_cy <= crop_y + crop_h:
+                subject_in_crop += 1
             else:
-                # Face center might be outside crop but bbox could still overlap
                 ix1 = max(crop_x, bbox.x)
                 iy1 = max(crop_y, bbox.y)
                 ix2 = min(crop_x + crop_w, bbox.x + bbox.width)
                 iy2 = min(crop_y + crop_h, bbox.y + bbox.height)
                 if ix2 > ix1 and iy2 > iy1:
-                    face_in_crop += 1
+                    subject_in_crop += 1
 
-    face_coverage = face_in_crop / total_traj if total_traj > 0 else 0.0
+    face_coverage = subject_in_crop / total_traj if total_traj > 0 else 0.0
 
     # --- Audio coverage: fraction of segment with speech ---
     from .video_audio import detect_speech_activity

@@ -60,7 +60,7 @@ VIDEO_KEYFRAME_INTERVAL = 25  # 25fps → ~1 keyframe per second
 
 # Frame sampling rate for perception (frames per second to analyze)
 VIDEO_SAMPLE_FPS = 4.0          # detection/tracking sampling
-VIDEO_LANDMARK_FPS = 2.0       # face landmark sampling (MAR computation)
+VIDEO_LANDMARK_FPS = 2.0       # face landmark/MAR sampling
 
 # Frame resize for AI model inference (keeps CPU inference fast)
 INFERENCE_WIDTH = 640

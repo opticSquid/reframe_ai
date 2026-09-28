@@ -2,7 +2,7 @@
 
 import { useState, useRef, useCallback } from "react";
 
-const BACKEND_URL = process.env.NEXT_PUBLIC_BACKEND_URL || "";
+const BACKEND_URL = process.env.NEXT_PUBLIC_BACKEND_URL || "http://localhost:5000";
 
 type ProgressEvent = { message: string; percent: number };
 type CompleteEvent = { complete: true; summary: any; type: "image" | "video" };
@@ -30,7 +30,17 @@ function toStaticUrl(absolutePath: string): string {
   }
   // Encode each path segment to handle special chars (?, #, spaces, etc.)
   const encodedPath = path.split("/").map(encodeURIComponent).join("/");
-  return `/output/${encodedPath}`;
+  return `${BACKEND_URL}/output/${encodedPath}`;
+}
+
+// Convert a ratio name like "16_9" to a Tailwind aspect-ratio class
+function ratioToAspectClass(ratio: string): string {
+  const [wStr, hStr] = ratio.split("_");
+  const w = parseInt(wStr, 10);
+  const h = parseInt(hStr, 10);
+  if (!w || !h) return "aspect-square";
+  if (w === h) return "aspect-square";
+  return `aspect-[${w}/${h}]`;
 }
 
 const UploadIcon = () => (
@@ -145,8 +155,8 @@ function ImageResults({ summary }: { summary: any }) {
         const url = toStaticUrl(v.render_path);
         return (
           <div key={ratio} className="bg-white rounded-lg shadow p-4">
-            <div className="bg-slate-100 rounded overflow-hidden mb-3">
-              <img src={url} alt={`Crop ${ratio}`} className="w-full h-48 object-cover" />
+            <div className={`bg-slate-100 rounded overflow-hidden mb-3 ${ratioToAspectClass(ratio)}`}>
+              <img src={url} alt={`Crop ${ratio}`} className="w-full h-full object-cover" />
             </div>
             <div className="flex justify-between items-center">
               <span className="font-medium text-sm">{ratio}</span>
@@ -172,8 +182,8 @@ function VideoResults({ summary }: { summary: any }) {
       {/* Reel */}
       <div className="bg-white rounded-lg shadow p-4">
         <h3 className="font-medium mb-2">Vertical Reel (9:16)</h3>
-        <div className="aspect-video max-w-xs mx-auto">
-          <video src={toStaticUrl(outputs.reel)} controls className="w-full h-auto rounded" />
+        <div className="aspect-[9/16] max-w-xs mx-auto">
+          <video src={toStaticUrl(outputs.reel)} controls className="w-full h-full rounded" />
         </div>
         <div className="flex justify-center mt-2">
           <a href={toStaticUrl(outputs.reel)} download className="inline-flex items-center gap-1 text-sm bg-slate-100 px-3 py-1 rounded hover:bg-slate-200">
@@ -190,10 +200,11 @@ function VideoResults({ summary }: { summary: any }) {
             const basename = still.split("/").pop() || "";
             const match = basename.match(/_(\d+)_(\d+)\./);
             const ratioLabel = match ? `${match[1]}:${match[2]}` : "Still";
+            const ratioName = match ? `${match[1]}_${match[2]}` : "";
             return (
               <div key={still} className="bg-white rounded-lg shadow p-3 text-center">
-                <div className="relative mb-2">
-                  <img src={toStaticUrl(still)} alt={`Still ${ratioLabel}`} className="w-full h-32 object-cover rounded" />
+                <div className={`relative mb-2 ${ratioToAspectClass(ratioName)}`}>
+                  <img src={toStaticUrl(still)} alt={`Still ${ratioLabel}`} className="w-full h-full object-cover rounded" />
                   <span className="absolute top-1 right-1 bg-slate-800/70 text-white text-xs px-1.5 py-0.5 rounded">
                     {ratioLabel}
                   </span>
@@ -211,7 +222,9 @@ function VideoResults({ summary }: { summary: any }) {
       {outputs.debug && (
         <div className="bg-white rounded-lg shadow p-4">
           <h3 className="font-medium mb-2">Debug Overlay (tracking + speaker)</h3>
-          <video src={toStaticUrl(outputs.debug)} controls className="w-full max-w-2xl rounded" />
+          <div className="aspect-[9/16] max-w-xs mx-auto">
+            <video src={toStaticUrl(outputs.debug)} controls className="w-full h-full rounded" />
+          </div>
         </div>
       )}
     </div>
@@ -259,7 +272,7 @@ export default function Home() {
     formData.append("file", file);
 
     try {
-      const resp = await fetch(`/process`, {
+      const resp = await fetch(`${BACKEND_URL}/process`, {
         method: "POST",
         body: formData,
         headers: { "Accept": "text/event-stream" },

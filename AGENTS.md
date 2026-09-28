@@ -6,9 +6,10 @@ Subject-aware media pipeline: master image → 4 subject-aware crops; master vid
 
 - Python 3.14 (`.python-version` pinned). Use `uv` everywhere:
   ```bash
-  uv venv --python 3.14 .venv && source .venv/bin/activate && uv pip install -r requirements.txt
+  uv sync --all-extras
   ```
-- `requirements.txt` is output of `uv pip freeze` — regenerate with that command, don't hand-edit.
+  This creates `.venv/` and installs all dependencies (including dev extras) from
+  `pyproject.toml` + `uv.lock`. No `requirements.txt` — uv is the single source of truth.
 - `GEMINI_API_KEY` env var required for AI features. Copy `.env.example → .env`, never commit `.env`.
   Other vars from `.env.example`: `BACKEND_HOST`, `BACKEND_PORT` (backend server),
   `NEXT_PUBLIC_BACKEND_URL` (frontend→backend API URL).
