@@ -21,7 +21,7 @@ from typing import Any
 import numpy as np
 
 from .video_audio import SpeechActivity
-from .video_perception import TrackedPerson, DetectedFace
+from .video_perception import TrackedPerson, DetectedFace, DetectedPerson
 
 
 @dataclass
@@ -186,8 +186,9 @@ def infer_active_speaker_timeline(
             best_score = -1.0
             for track in tracks:
                 # Get nearest bbox to this time
-                nearest_bbox = _nearest_bbox_at_time(track, t)
-                if nearest_bbox is not None:
+                nearest = _nearest_bbox_at_time(track, t)
+                if nearest is not None:
+                    nearest_bbox, _is_person = nearest
                     # Use horizontal position as a discriminator
                     cx = nearest_bbox.x + nearest_bbox.width / 2
                     # Normalize: left = 0, right = 1
@@ -283,8 +284,27 @@ def infer_active_speaker_timeline(
 def _nearest_bbox_at_time(
     track: TrackedPerson,
     t: float,
-) -> Any | None:
-    """Find the bbox nearest to time t for a track."""
+    prefer_persons: bool = True,
+) -> tuple[Any, bool] | None:
+    """Find the bbox nearest to time t for a track.
+
+    Returns ``(bbox, is_person)`` where ``is_person`` is True when the
+    bbox came from the person detector (full-body) vs face detector.
+    Prefers person bboxes when available since they are larger and more
+    stable; falls back to face bboxes.
+    """
+    # Try person bboxes first
+    if prefer_persons and track.person_bboxes:
+        best_bbox: Any = None
+        best_diff = float("inf")
+        for p in track.person_bboxes:
+            diff = abs(p.timestamp - t)
+            if diff < best_diff:
+                best_diff = diff
+                best_bbox = p
+        if best_bbox is not None:
+            return (best_bbox, True)
+    # Fallback: face bboxes
     best_bbox = None
     best_diff = float("inf")
     for f in track.face_bboxes:
@@ -292,7 +312,9 @@ def _nearest_bbox_at_time(
         if diff < best_diff:
             best_diff = diff
             best_bbox = f
-    return best_bbox
+    if best_bbox is not None:
+        return (best_bbox, False)
+    return None
 
 
 def build_crop_trajectory(
@@ -307,6 +329,8 @@ def build_crop_trajectory(
     target_coverage: float = 0.4,
     smoothing_alpha: float = 0.2,
     initial_center: tuple[float, float] | None = None,
+    shot_boundaries: list[int] | None = None,
+    scene_change_centers: dict[float, tuple[float, float]] | None = None,
 ) -> list[CropTrajectoryPoint]:
     """Build a per-frame crop trajectory driven by the active speaker timeline.
 
@@ -320,6 +344,13 @@ def build_crop_trajectory(
         Optional (normalized_x, normalized_y) crop center to initialize the
         EMA smoothing. When provided (e.g. from Gemini crop planning), the
         trajectory starts from this center instead of the first face bbox.
+    shot_boundaries
+        Frame indices where shot boundaries (scene changes) were detected.
+    scene_change_centers
+        Map of shot-boundary timestamps → (normalized cx, cy) from Gemini.
+        At each shot boundary that has a recommendation, the EMA-smoothed
+        crop center is snapped to the recommended position, enabling
+        scene-change-aware re-framing.
     """
     from .cropper import Subject, compute_crop
 
@@ -343,22 +374,24 @@ def build_crop_trajectory(
     # For each frame, determine the active speaker and their predicted bbox
     trajectory: list[CropTrajectoryPoint] = []
 
-    # Interpolate track bboxes over time
-    track_data: dict[int, list[tuple[float, DetectedFace]]] = {}
+    # Interpolate track bboxes over time.
+    # Prefer person bboxes (full-body, larger, more stable). Fall back to face.
+    track_face_data: dict[int, list[tuple[float, DetectedFace]]] = {}
+    track_person_data: dict[int, list[tuple[float, DetectedPerson]]] = {}
     for track in tracks:
         for bbox in track.face_bboxes:
-            track_data.setdefault(track.id, []).append((bbox.timestamp, bbox))
+            track_face_data.setdefault(track.id, []).append((bbox.timestamp, bbox))
+        for pb in track.person_bboxes:
+            track_person_data.setdefault(track.id, []).append((pb.timestamp, pb))
 
-    def predict_bbox(track_id: int, t: float) -> tuple[int, int, int, int] | None:
-        """Predict face bbox for a track at time t via linear interpolation."""
-        samples = track_data.get(track_id, [])
+    def _interp(samples: list[tuple[float, Any]], t: float) -> tuple[int, int, int, int] | None:
+        """Linearly interpolate a bbox at time t."""
         if not samples:
             return None
         if len(samples) == 1:
             b = samples[0][1]
             return (b.x, b.y, b.width, b.height)
         times = [s[0] for s in samples]
-        # Find bracketing samples
         if t <= times[0]:
             b = samples[0][1]
         elif t >= times[-1]:
@@ -387,6 +420,16 @@ def build_crop_trajectory(
     # Smoothed crop center
     smooth_cx: float | None = None
     smooth_cy: float | None = None
+
+    # Pre-compute Gemini-recommended scene-change centers (frame index → (cx, cy))
+    scene_change_frames: dict[int, tuple[float, float]] = {}
+    if scene_change_centers and shot_boundaries:
+        for fb in shot_boundaries:
+            t = fb / fps
+            for sc_ts, sc_center in sorted(scene_change_centers.items()):
+                if abs(t - sc_ts) < 2.0:  # within 2s of shot boundary
+                    scene_change_frames[fb] = sc_center
+                    break
 
     # Initialize from Gemini-recommended center if provided
     if initial_center is not None:
@@ -420,19 +463,39 @@ def build_crop_trajectory(
 
     for fi in range(total_frames):
         t = fi / fps
+
+        # Scene-change-aware centering: at shot boundaries, snap to Gemini-recommended center
+        if fi in scene_change_frames:
+            sc_cx, sc_cy = scene_change_frames[fi]
+            smooth_cx = float(sc_cx) * source_width
+            smooth_cy = float(sc_cy) * source_height
+
         speaker_id = get_active_speaker(t)
 
         if speaker_id is not None:
             track = next((tr for tr in tracks if tr.id == speaker_id), None)
             if track is not None:
-                bbox = predict_bbox(track.id, t)
+                # Prefer person bbox (larger, more stable); fall back to face
+                person_samples = track_person_data.get(track.id, [])
+                face_samples = track_face_data.get(track.id, [])
+                bbox = _interp(person_samples, t)
+                is_person_bbox = True
+                if bbox is None:
+                    bbox = _interp(face_samples, t)
+                    is_person_bbox = False
                 if bbox is not None:
                     fx, fy, fw, fh = bbox
-                    # Asymmetric padding to include shoulders and headroom.
-                    # MediaPipe BlazeFace bboxes are face-only (forehead to chin).
-                    pad_x = 0.5       # 25% each side for shoulders
-                    pad_y_top = 0.5   # 50% above face for hair/headroom (was 0.4)
-                    pad_y_bottom = 0.5  # 50% below face for chin/shoulders (was 0.6)
+                    if is_person_bbox:
+                        # Person bbox already includes shoulders and head —
+                        # add modest padding for headroom and composition.
+                        pad_x = 0.15       # 7.5% each side for margin
+                        pad_y_top = 0.25   # 25% above bbox for headroom
+                        pad_y_bottom = 0.10  # 10% below for slight footroom
+                    else:
+                        # Face-only bbox needs heavy padding to reach shoulders.
+                        pad_x = 0.5       # 25% each side for shoulders
+                        pad_y_top = 0.5   # 50% above face for hair/headroom
+                        pad_y_bottom = 0.5  # 50% below face for chin/shoulders
                     scaled_w = int(round(fw * (1 + pad_x)))
                     scaled_h = int(round(fh * (1 + pad_y_top + pad_y_bottom)))
                     scaled_x = max(0, fx - int(pad_x * fw / 2))
