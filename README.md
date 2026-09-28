@@ -461,11 +461,11 @@ reframe_ai/
 
 ---
 
-## MediaPipe models (committed, 108MB total — no download needed)
+## MediaPipe models
 
-All model files are committed in `models/`. Only 4 MediaPipe models are actively used by the pipeline; the rest are bundled extras from the MediaPipe model distribution that are **not referenced by any code in `src/`**.
+All model files are committed in `models/`.
 
-**Used by the pipeline (21MB):**
+**Computer Vision Models of MediaPipe used by the pipeline**
 
 | File | Size | Used by |
 |---|---|---|
