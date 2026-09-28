@@ -474,18 +474,6 @@ All model files are committed in `models/`. Only 4 MediaPipe models are actively
 | `efficientdet_lite0_float16.tflite` | 6.9M | Person detection (full-body bboxes, `video_perception.py`) |
 | `pose_landmarker_full_float16.task` | 9.0M | Pose estimation (pose landmarks for Gemini keyframe grid, `video_review.py`) |
 
-**Committed but unused (87MB — bundled extras, no `src/` references):**
-
-| File | Size | Purpose (not currently wired) |
-|---|---|---|
-| `deeplab_v3_float32.tflite` | 2.6M | Semantic segmentation |
-| `efficientnet_lite0_float32.tflite` | 17.7M | Image classification |
-| `gesture_recognizer_float16.task` | 8.0M | Hand gesture recognition |
-| `hand_landmarker_float16.task` | 7.5M | Hand landmark detection |
-| `holistic_landmarker_float16.task` | 13.0M | Combined face + pose + hands |
-| `interactive_segmentation_int8.task` | 29.1M | Interactive image segmentation |
-| `mobilenet_v3_large_float32.tflite` | 10.4M | Image classification |
-
 Referenced via `config.MODELS_DIR` — never hard-coded paths.
 
 ---
