@@ -1,5 +1,8 @@
 # ReframeAI
 
+## Demo Video
+[![Video Title](https://img.youtube.com/vi/-gDFGZmmA28/0.jpg)](https://www.youtube.com/watch?v=-gDFGZmmA28)
+
 ## One master asset. Infinite platform-ready versions. Zero manual cropping.
 
 Every OTT platform and entertainment company faces the same expensive bottleneck: one high-quality master image or video must become dozens of platform-specific assets. A movie poster needs 1:1 for Instagram feed, 16:9 for YouTube thumbnails, 9:16 for TikTok and Instagram Reels, 4:5 for Instagram Stories. An episode clip needs a vertical reel for Shorts, square stills for promo, audio-inclusive cuts for autoplay feeds. And each output must carry the correct watermark, keep the talent in frame, meet exact dimension rules, and pass quality review — or content operations loses hours to manual crop-and-polish cycles.
